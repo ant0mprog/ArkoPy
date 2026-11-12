@@ -181,7 +181,18 @@ BALL_SPEED_PER_LEVEL = 1.5
 # Плавность движения даёт не низкая скорость, а ровный профиль: разгон ->
 # полка -> торможение точно в цель (см. follow_paddle_command).
 PADDLE_TO_BALL = 3.4    # примерно 1.15 x MAX_VX: запас, чтобы догонять шарик на диагонали
-PADDLE_ACCEL = 16.0     # 1/с: за 1/16 с ракетка выходит на максимум и за столько же садится
+# У ракетки — три разных усилия, а не одно, как у машины, где тормоза сильнее
+# мотора. Одна константа и на разгон, и на торможение делает либо вату
+# («резиновую» остановку), либо пинок вместо старта; здесь профили разные:
+#   разгон       — инерция, старт заметен глазом, клетка укладывается в 2 кадра;
+#   торможение   — чуть злее разгона, остановка читается как решение игрока;
+#   встречное    — самое злое, это смена направления: гасим ход быстро и
+#                  разворачиваемся, не проскакивая тап на весь «зазор опережения».
+# Все три привязаны к максимальной скорости, поэтому время разгона одинаковое и
+# на 40, и на 200 колонок (см. World.paddle_accel).
+PADDLE_ACCEL = 16.0     # 1/с: разгон, 62 мс до полки
+PADDLE_BRAKE = 21.0     # 1/с: торможение вдоль хода (1.3 x разгона)
+PADDLE_REVERSE = 1.5    # x PADDLE_BRAKE: встречное торможение при смене направления
 PADDLE_SNAP = 0.02      # остаток пути и скорость меньше этого считаются нулём
 PADDLE_KEY_STEP = 1.0   # один тап клавиши = ровно одна клетка, позиция всегда точная
 POWERUP_SPEED = 7.0
@@ -441,6 +452,8 @@ class World:
     paddle_vel: float = 0.0              # текущая скорость, клеток/с
     paddle_target: float | None = None   # цель от мыши (или тестового «игрока»)
     paddle_dir: int = 0                  # -1 / 0 / 1 при удержании клавиши
+    paddle_held: int = 0                 # кто владеет paddle_cmd: 0 — адрес (тап,
+                                         # мышь, Home/End), ±1 — газ удержания
 
     combo: int = 0
     speed: float = BALL_SPEED
@@ -467,7 +480,15 @@ class World:
     # --- геометрия ---------------------------------------------------------
     @property
     def paddle_x(self) -> int:
-        return int(round(self.paddle_pos))
+        """
+        Клетка, где ракетка видна и откуда отскакивает шарик.
+
+        floor(x + 0.5), а не round(x): built-in round округляет к чётному, и
+        ракета ровно на полуклетке рисовалась бы на разных клетках в зависимости
+        от чётности соседней клетки. Игрок не должен терять клетку из-за того,
+        что не может увидеть.
+        """
+        return int(math.floor(self.paddle_pos + 0.5))
 
     @property
     def size_scale(self) -> float:
@@ -498,9 +519,49 @@ class World:
 
     @property
     def paddle_accel(self) -> float:
-        """Ускорение ракетки, клеток/с². Привязано к макс. скорости: время разгона
+        """Разгон ракетки, клеток/с². Привязан к макс. скорости: время разгона
         одинаковое и на 40, и на 200 колонок."""
         return PADDLE_ACCEL * self.paddle_speed
+
+    @property
+    def paddle_brake(self) -> float:
+        """Торможение вдоль хода, клеток/с². Злее разгона — см. PADDLE_BRAKE."""
+        return PADDLE_BRAKE * self.paddle_speed
+
+    def paddle_decel(self, direction: float) -> float:
+        """
+        Как быстро ракетка гасит свою скорость.
+
+        Вдоль хода работает обычный тормоз, навстречу ходу (команда смотрит в
+        противоположную сторону) — встречный, злее на PADDLE_REVERSE: разворот
+        должен быть коротким и управляемым, а не пятикадровым проносом.
+        """
+        return self.paddle_brake * (PADDLE_REVERSE if direction * self.paddle_vel < 0 else 1.0)
+
+    @property
+    def paddle_braking_distance(self) -> float:
+        """
+        Тормозной путь на полной скорости, клеток.
+
+        Главная «цена» инерции: и съезд после отпускания клавиши, и пронос при
+        смене направления измеряются этим числом (на 80×24 ≈ 3.2 клетки). Все
+        производные от скорости, поэтому на разных терминалах ракетка ведёт себя
+        одинаково по времени, а не по клеткам.
+        """
+        return self.paddle_speed ** 2 / (2 * self.paddle_brake)
+
+    @property
+    def paddle_stop(self) -> float:
+        """
+        Клетка, в которой ракетка встанет, если начать тормозить прямо сейчас.
+
+        «Точка зрения игрока» и она же — единственное, что обещает удержание
+        клавиши (удержание — газ, а не координата). Тестами проверено, что
+        честное торможение в glide_paddle_to_stop приводит ровно сюда.
+        """
+        glide = self.paddle_braking_distance * (self.paddle_vel / self.paddle_speed) ** 2
+        return float(clamp(self.paddle_pos + math.copysign(glide, self.paddle_vel),
+                           self.paddle_min, self.paddle_max))
 
     @property
     def paddle_min(self) -> float:
@@ -827,6 +888,9 @@ def apply_powerup(world: World, kind: str, events: list[Event]) -> None:
     events.append("powerup")
     if kind == "E":
         world.effects["E"] = 12.0
+        # ракета стала шире — правый край поля отъехал на её ширину, и если
+        # она стояла у стенки, в стене она оставаться не должна
+        fit_paddle_to_field(world)
     elif kind == "S":
         world.effects["S"] = 8.0
     elif kind == "L":
@@ -853,22 +917,78 @@ def step_powerups(world: World, dt: float, events: list[Event]) -> None:
     world.powerups = alive
 
 
+def command_paddle_address(world: World, position: float) -> None:
+    """
+    Заявить адрес: клетку, до которой ракетка ОБЯЗАНА доехать (тап, Home/End,
+    курсор мыши).
+
+    Адрес отличается от газа (hold_paddle_command) тем, что его нельзя
+    отменить торможением: если игрок назвал клетку, ракета разворачивается и
+    едет к ней, а не «плавно останавливается там, где сама хотела». Поэтому
+    адрес снимает флаг удержания: с этого кадра незакрытая команда — именно он.
+    """
+    world.paddle_held = 0
+    world.paddle_cmd = float(clamp(position, world.paddle_min, world.paddle_max))
+
+
+def fit_paddle_to_field(world: World) -> None:
+    """
+    Вернуть ракетку внутрь поля, если границы сузились.
+
+    Сузиться они могут и без resize: бонус «шире» (E) отодвигает правую границу
+    на свою ширину. Без этой страховки ракетка, прижавшаяся к стенке, оставалась
+    висеть за новой границей и не возвращалась — упираясь в запрет, ветки
+    move_paddle её больше не трогали (ловит --smoke: «ракетка за границей»).
+    """
+    inside = float(clamp(world.paddle_pos, world.paddle_min, world.paddle_max))
+    if inside != world.paddle_pos:
+        world.paddle_pos = inside
+        world.paddle_cmd = inside
+        world.paddle_vel = 0.0            # в стену встала, отскока нет
+
+
 def move_paddle(world: World, dt: float) -> None:
     """
     Ракетка едет к «командной» позиции, а не телепортируется в неё.
 
     Схема такая: игрок (клавиши, мышь, тестовый бот) дёргает только paddle_cmd,
     а paddle_pos догоняет его с ограниченным ускорением. Профиль скорости
-    трапецеидальный: разгон -> полка на максимуме -> торможение ровно в цель,
-    поэтому без разницы, тапнул игрок один раз или зажал клавишу — ракетка
-    нигде не проскакивает нужную клетку и не дёргается на старте.
+    трапецеидальный: разгон -> полка -> торможение ровно в цель, поэтому без
+    разницы, тапнул игрок один раз или зажал клавишу — ракетка нигде не
+    проскакивает нужную клетку и не дёргается на старте.
+
+    Источником команды за кадр бывает ровно один из них, они не складываются:
+      * цель от мыши — она важнее клавиш (рука ушла на мышь, клавиши отпущены);
+      * удержание клавиши — это ГАЗ: команда держится в точке, где ракетка
+        успела бы встать, а не убегает в неизвестность;
+      * незакрытая команда тапа / Home / End — это АДРЕС, к нему ракета едет
+        до клетки;
+      * ничего из этого — чистое торможение (glide_paddle_to_stop).
+
+    Кто владеет командой, помечено в paddle_held: удержание кончается, а адрес
+    остаётся до тех пор, пока ракетка к нему не доехала. Поэтому «отпустили
+    клавишу» и «адрес ещё не отработан» — разные ситуации, и путать их нельзя:
+    встречный тап, данный на ходу, остаётся адресом, даже если клавишу тут же
+    зажгли снова (газ подключится только когда ракета поедет в ту сторону).
     """
+    was_held = world.paddle_held        # чем был записан paddle_cmd в прошлый раз
+    world.paddle_held = 0               # решение примет одна из ветвей ниже
+    fit_paddle_to_field(world)
+
     if world.paddle_target is not None:
-        world.paddle_cmd = world.paddle_target
+        # мышь важнее клавиш (рука ушла на мышь, клавиши отпустили)
+        command_paddle_address(world, world.paddle_target)
     elif world.paddle_dir:
-        world.paddle_cmd += world.paddle_dir * world.paddle_speed * dt
+        hold_paddle_command(world, world.paddle_dir, dt)   # сам скажет, что владеет командой
+    elif was_held:
+        # Газ убрали ровно сейчас. Дотягиваться до команды удержания нельзя:
+        # это не адрес, а накопленный зазор опережения, и «точка» у неё всегда
+        # впереди — ракета проехала бы ещё один тормозной путь сверху (замер:
+        # 5.3 клетки съезда вместо 3.2). С этого кадра — чистое торможение.
+        glide_paddle_to_stop(world, dt)
+        return
     elif abs(world.paddle_cmd - world.paddle_pos) <= PADDLE_SNAP:
-        # Ввода нет и незакрытой команды тоже нет (клавишу отпустили на ходу):
+        # Ввода нет и незакрытой команды тоже нет (тап уже отработан):
         # плавно гасим скорость. Если команда ещё впереди — едем к ней, иначе
         # одиночный тап клавиши терялся бы, не начавшись.
         glide_paddle_to_stop(world, dt)
@@ -876,6 +996,62 @@ def move_paddle(world: World, dt: float) -> None:
 
     world.paddle_cmd = float(clamp(world.paddle_cmd, world.paddle_min, world.paddle_max))
     follow_paddle_command(world, dt)
+
+
+def tap_paddle(world: World, direction: int, step: float = PADDLE_KEY_STEP) -> None:
+    """
+    Одиночный тап клавиши: заявить ровно одну клетку от той, что игрок видит.
+
+    Якорь — клетка (world.paddle_x), а не незакрытая команда. Отсюда две гарантии
+    предсказуемости:
+
+      * тап даёт ровно клетку относительно картинки: ракета рисуется целыми
+        клетками, и 0.4 клетки, уже съеденные предыдущим тапом, выглядели бы как
+        проглоченное нажатие, а десять тапов на бегу не превращались бы в «семь
+        с половиной»;
+      * тап не накапливает ошибку — команда удержания живёт по своим правилам
+        (hold_paddle_command) и при новом нажатии серии заменяется целью тапа.
+
+    Если ракета уже едет в сторону тапа, якорь — фактическая позиция: начатые
+    полклетки засчитаны, обратного хода через цель нет. Если же она едет
+    НАВСТРЕЧУ (разворот), якорь остаётся клеткой: тап честно требует разворота,
+    а не мгновенного стопа — сначала встречное торможение, потом клетка назад.
+    """
+    world.paddle_target = None
+    anchor = float(world.paddle_x)
+    if (world.paddle_pos - anchor) * direction > 0.0:
+        anchor = world.paddle_pos
+    command_paddle_address(world, anchor + direction * step)
+
+
+def hold_paddle_command(world: World, direction: int, dt: float) -> None:
+    """
+    Удержание клавиши — это газ, а не адрес: «едем в эту сторону», а не «надо
+    оказаться в 40 клетках».
+
+    Формально газ выражается всё той же командной позицией — канал у мыши,
+    тапов и физики один, — поэтому дистанция этой позиции ограничена:
+
+      * на один кадр впереди — ровно настолько, чтобы сервопривод просил полную
+        скорость, а не «чуть-чуть» (меньше — ракетка залипает на текущей,
+        больше — в команде появляется запас, который потом отрабатывается
+        лишним кадром хода);
+      * не дальше точки честной остановки (world.paddle_stop) плюс кадр хода —
+        иначе за секунду удержания команда уезжает на весь накопленный зазор.
+
+    И главное: вперёд команда убегает только по своему ходу (или стоя на месте —
+    иначе удержание вообще не сдвинуло бы ракетку с места). При смене направления
+    целью владеет тап, начавший серию, и толкать команду вперёд нельзя: ракета
+    проскочила бы тап на весь зазор (замер: встречное нажатие на полном ходу
+    давало +2 клетки вперёд вместо разворота).
+    """
+    if direction * world.paddle_vel < 0.0:
+        return                # целью владеет адрес тапа; газ — после разворота
+    world.paddle_held = direction
+    ahead = world.paddle_cmd + direction * world.paddle_speed * dt
+    limit = world.paddle_pos + direction * (world.paddle_braking_distance + world.paddle_speed * dt)
+    # дальше упора не пускаем (знак направления решает, что «дальше»)
+    world.paddle_cmd = min(ahead, limit) if direction > 0 else max(ahead, limit)
 
 
 def glide_paddle_to_stop(world: World, dt: float) -> None:
@@ -886,13 +1062,20 @@ def glide_paddle_to_stop(world: World, dt: float) -> None:
     пересчитывать каждый кадр, и получаются «бегущие ворота» — по тормозной
     кривой ракета всегда ещё может остановиться в цели, то есть никогда не
     тормозит (замерено: 30 клеток проноса вместо 4). Поэтому здесь просто
-    гасим скорость с тем же ускорением: съезд плавный, без возврата назад.
+    гасим скорость тормозом: съезд плавный, без возврата назад.
+
+    Команда идёт за позицией, а не висит впереди: отпускание клавиши — это
+    «едем до упора в скорость, потом встаём», а не «дотянемся до последней
+    команды удержания». Иначе одна и та же отпущенная клавиша давала бы две
+    точки остановки (по цели и по торможению) — не предсказуемо.
     """
     if world.paddle_vel:
+        carried = world.paddle_vel
         # знак противоположен скорости: гасим её, а не разгоняем
-        brake = -math.copysign(min(abs(world.paddle_vel), world.paddle_accel * dt), world.paddle_vel)
+        brake = -math.copysign(min(abs(carried), world.paddle_brake * dt), carried)
         world.paddle_vel += brake
-        world.paddle_pos += world.paddle_vel * dt
+        world.paddle_pos += (carried + world.paddle_vel) * 0.5 * dt   # путь по средней за кадр
+        world.paddle_cmd = world.paddle_pos
 
         if world.paddle_pos < world.paddle_min or world.paddle_pos > world.paddle_max:
             world.paddle_pos = float(clamp(world.paddle_pos, world.paddle_min, world.paddle_max))
@@ -903,10 +1086,25 @@ def glide_paddle_to_stop(world: World, dt: float) -> None:
 
 
 def follow_paddle_command(world: World, dt: float) -> None:
-    """Один шаг разгона/торможения ракетки к world.paddle_cmd."""
+    """
+    Один шаг разгона/торможения ракетки к world.paddle_cmd.
+
+    Разрешённая скорость sqrt(2·a·|до_цели|) отвечает на вопрос «ещё успею ли я
+    встать в цель именно с такой скоростью»; прирост скорости за кадр ограничен
+    мотором (paddle_accel) при разгоне и тормозом (paddle_decel) при гашении.
+    Отдельной ветки «а теперь прыжок» нет.
+
+    Путь за кадр считается по СРЕДНЕЙ скорости кадра, а не по новой. Это не
+    косметика: при «новой скорости × dt» шаг из покоя равен a·dt², первый же кадр
+    съедал полклетки — старт выглядел пинком, тап в одну клетку отрисовывался
+    телепортом за один кадр, а ступенька вниз на финише была ударом об асфальт.
+    Средняя скорость даёт настоящую параболу 0.5·a·dt²: первые полкадра ракетка
+    «отлипает от места», а тормозной хвост не обрывается.
+    """
     accel = world.paddle_accel
+    brake = world.paddle_brake
     distance = world.paddle_cmd - world.paddle_pos
-    stopping = world.paddle_vel**2 / (2 * accel)     # путь до полной остановки
+    stopping = world.paddle_vel**2 / (2 * brake)      # путь до полной остановки
 
     if abs(distance) <= PADDLE_SNAP and stopping <= PADDLE_SNAP:
         # доехали: фиксируем позицию ровно на клетке, чтобы шарик отскакивал
@@ -915,13 +1113,18 @@ def follow_paddle_command(world: World, dt: float) -> None:
         world.paddle_vel = 0.0
         return
 
-    # Скорость, при которой ещё успеем затормозить именно в цели (v = sqrt(2*a*s)):
+    # Скорость, при которой ещё успеем затормозить именно в цели (v = sqrt(2·a·s)):
     # пока далеко — выходит на максимум, вблизи сам собой начинается плавный съезд.
-    allowed = math.copysign(math.sqrt(2.0 * accel * abs(distance)), distance)
+    allowed = math.copysign(math.sqrt(2.0 * brake * abs(distance)), distance)
     desired = allowed if abs(allowed) <= world.paddle_speed else math.copysign(world.paddle_speed, allowed)
 
-    world.paddle_vel += clamp(desired - world.paddle_vel, -accel * dt, accel * dt)
-    new_pos = world.paddle_pos + world.paddle_vel * dt
+    delta = desired - world.paddle_vel
+    # Гасим скорость (delta против хода) — работаем тормозом, причём навстречу
+    # ходу он встречный, злее; разгоняемся — только мотором.
+    rate = world.paddle_decel(desired) if delta * world.paddle_vel < 0.0 else accel
+    carried = world.paddle_vel
+    world.paddle_vel += clamp(delta, -rate * dt, rate * dt)
+    new_pos = world.paddle_pos + (carried + world.paddle_vel) * 0.5 * dt
 
     if distance * (world.paddle_cmd - new_pos) < 0 and distance * world.paddle_vel > 0:
         # Предсказание: с такой скоростью цель проскакивается за этот же кадр
@@ -1036,9 +1239,10 @@ def resize(world: World, width: int, height: int) -> None:
     world.width, world.height = width, height
     world.arena = Arena.fit(width, height, world.cfg.max_arena_width)
     world.speed = world.level_speed(world.level)
-    world.paddle_pos = float(clamp(world.paddle_pos, world.paddle_min, world.paddle_max))
-    world.paddle_cmd = world.paddle_pos
     world.paddle_vel = 0.0
+    world.paddle_held = 0        # старое удержание не должно притворяться командой
+    fit_paddle_to_field(world)   # границы-то теперь другие
+    world.paddle_cmd = world.paddle_pos
     world.reset_level()
     world.powerups = []
     world.balls = []
@@ -1503,10 +1707,10 @@ class Game:
         return True
 
     def move_paddle_to(self, position: float) -> None:
-        """Home/End: задать цель, а ракета доедет сама с разгоном и торможением."""
+        """Home/End: заявить адрес у стенки, а ракета доедет сама с разгоном и торможением."""
         self.repeat.reset()
         self.world.paddle_target = None
-        self.world.paddle_cmd = float(clamp(position, self.world.paddle_min, self.world.paddle_max))
+        command_paddle_address(self.world, position)
 
     def nudge_paddle(self, direction: int) -> None:
         """
@@ -1516,12 +1720,15 @@ class Game:
         только в main-loop (paddle_dir), а не ещё и по каждому событию: иначе
         автоповтор и непрерывное движение складывались бы и ракета летела вдвое
         быстрее максимума.
+
+        Тап объявляет цель через tap_paddle() — там же, где живёт физика, чтобы
+        правило «ровно одна клетка от видимой клетки» действовало одинаково для
+        игры, тестов и болвана в --smoke.
         """
         world = self.world
         world.paddle_target = None
         if not self.repeat.press(direction, time.monotonic()):
-            world.paddle_cmd = float(clamp(world.paddle_cmd + direction * PADDLE_KEY_STEP,
-                                           world.paddle_min, world.paddle_max))
+            tap_paddle(world, direction)
         # paddle_dir выставляет main-loop по active_direction(), а не здесь:
         # иначе одиночный тап успевал бы ещё и подтолкнуть команду на пару клеток.
 

@@ -305,11 +305,50 @@ class PaddleMotionTest(unittest.TestCase):
             path.append(self.world.paddle_pos)
         return path
 
+    def trace(self, frames: int, direction: int) -> list[float]:
+        """Скорости по кадрам — как их видит main-loop: paddle_dir приходит каждый кадр."""
+        speeds = []
+        for _ in range(frames):
+            self.world.paddle_dir = direction
+            ark.move_paddle(self.world, self.dt)
+            speeds.append(self.world.paddle_vel)
+        return speeds
+
+    def hold_key(self, direction: int, frames: int) -> list[float]:
+        """Держать клавишу frames кадров."""
+        return self.drive_keys(frames, direction)
+
+    def release_key(self, frames: int) -> list[float]:
+        """Клавишу отпустили: paddle_dir = 0, командой владеет инерция либо адрес тапа."""
+        return self.drive_keys(frames, 0)
+
+    def drive_keys(self, frames: int, direction: int) -> list[float]:
+        path = []
+        for _ in range(frames):
+            self.world.paddle_dir = direction
+            ark.move_paddle(self.world, self.dt)
+            path.append(self.world.paddle_pos)
+        return path
+
+    def tap(self, direction: int) -> None:
+        ark.tap_paddle(self.world, direction)
+
+    @staticmethod
+    def deltas(path: list[float], first: float) -> list[float]:
+        return [b - a for a, b in zip([first] + path, path)]
+
     def test_tap_moves_exactly_one_cell_and_stops(self):
         start = self.world.paddle_pos
         self.world.paddle_cmd = start + ark.PADDLE_KEY_STEP
         self.drive(20)
         self.assertAlmostEqual(self.world.paddle_pos, start + 1, places=9)
+        self.assertEqual(self.world.paddle_vel, 0.0)
+        # и тап как событие ввода — тот же результат (общий код с игрой)
+        self.setUp()
+        self.tap(1)
+        self.release_key(20)
+        self.assertAlmostEqual(self.world.paddle_pos, start + 1, places=9)
+        self.assertEqual(self.world.paddle_x, int(start) + 1)
         self.assertEqual(self.world.paddle_vel, 0.0)
 
     def test_ten_taps_land_on_the_tenth_cell(self):
@@ -400,6 +439,227 @@ class PaddleMotionTest(unittest.TestCase):
             self.assertLessEqual(world.paddle_pos, world.paddle_max)
             self.assertEqual(world.paddle_vel, 0.0)
 
+    # --- тактильность: вес на старте, торможение, разворот ------------------
+
+    def test_first_frame_is_a_real_parabola(self):
+        """Старт — это 0.5·a·dt², а не a·dt².
+
+        Путь за кадр считается по средней скорости кадра. При «новая скорость ×
+        dt» первый кадр съедал 0.59 клетки: тап в одну клетку отрисовывался
+        телепортом за один кадр, веса ракетки не было видно вовсе, а ступенька на
+        финише читалась ударом. С параболой первый кадр — 0.29 клетки: ракета
+        «отлипает от места», и клетка по-прежнему укладывается в два кадра.
+        """
+        self.world.paddle_cmd = self.world.paddle_pos + 30
+        start = self.world.paddle_pos
+        steps = self.deltas(self.drive(3), start)
+        self.assertAlmostEqual(steps[0], self.world.paddle_accel * self.dt**2 / 2.0, places=9)
+        self.assertLess(steps[0], steps[1])
+        self.assertLess(steps[1], steps[2])
+
+    def test_release_brakes_without_killing_the_speed(self):
+        """Отпускание клавиши гасит скорость ТОРМОЗОМ: ни один кадр не убирает
+        больше paddle_brake·dt. Удар об точку остановки — это та же болезнь, что
+        и резина, только наоборот."""
+        world = self.world
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        speeds = [world.paddle_vel] + self.trace(40, 0)
+        worst = max(abs(b - a) / self.dt for a, b in zip(speeds, speeds[1:]))
+        self.assertLessEqual(worst, world.paddle_brake + 1e-6)
+        self.assertEqual(world.paddle_vel, 0.0)
+
+    def test_reversal_brakes_harder_than_a_plain_stop(self):
+        """Смена направления — встречный тормоз, он злее обычного ровно на
+        PADDLE_REVERSE: разворот занимает пару кадров, а не пять."""
+        world = self.world
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        self.tap(-1)
+        speeds = [world.paddle_vel] + self.trace(4, -1)
+        worst = max(abs(b - a) / self.dt for a, b in zip(speeds, speeds[1:]))
+        self.assertGreater(worst, world.paddle_brake + 1e-6, "встречного торможения не случилось")
+        self.assertLessEqual(worst, world.paddle_brake * ark.PADDLE_REVERSE + 1e-6)
+
+    def test_braking_steps_only_shrink(self):
+        """Шаги при торможении только уменьшаются по модулю и не меняют знак:
+        глаз читает «ракетка садится», а не «мигает»."""
+        self.start_from_left_wall()
+        held = self.hold_key(1, 20)
+        steps = self.deltas(self.release_key(10), held[-1])
+        self.assertTrue(all(abs(b) <= abs(a) + 1e-12 for a, b in zip(steps, steps[1:])),
+                        f"шаги торможения растут: {steps}")
+        self.assertTrue(all(s >= 0.0 for s in steps), f"торможение развернуло ракетку назад: {steps}")
+
+    def test_stop_point_is_predictable(self):
+        """paddle_stop говорит, где ракетка встанет, с точностью до кадра:
+        игрок обязан знать точку остановки до того, как она настала."""
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        predicted = self.world.paddle_stop
+        path = self.release_key(60)
+        self.assertAlmostEqual(path[-1], predicted, delta=self.world.paddle_speed * self.dt)
+        self.assertEqual(self.world.paddle_vel, 0.0)
+
+    def test_release_coasts_exactly_the_braking_distance(self):
+        """Отпустил клавишу — проехала тормозной путь, и только он.
+
+        Команда удержания — газ, а не адрес: «дотянуться» до неё означает
+        проехать ещё один тормозной путь сверху (замер старой схемы: 5.3 клетки
+        при тормозном пути 3.2) — глазами это «сама поехала дальше, когда
+        отпустил».
+        """
+        world = self.world
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        at_release, speed = world.paddle_pos, world.paddle_vel
+        lead = world.paddle_cmd - at_release
+        glide = self.release_key(60)
+        # первый кадр съезда — путь по СРЕДНЕЙ скорости кадра (0.5·тормоза·dt²),
+        # иначе съезд длиннее тормозного пути ровно на полкадра хода
+        self.assertAlmostEqual(glide[0] - at_release,
+                               speed * self.dt - 0.5 * world.paddle_brake * self.dt**2, places=9,
+                               msg="съезд интегрируется по новой скорости, а не по средней")
+        self.assertLessEqual(lead, world.paddle_braking_distance + 1e-9,
+                             "команда удержания убежала вперёд дальше точки остановки")
+        self.assertGreater(glide[-1] - at_release, 0.5 * world.paddle_braking_distance,
+                           "ракетка рубила ход вместо съезда")
+        self.assertAlmostEqual(glide[-1] - at_release, world.paddle_braking_distance,
+                               delta=world.paddle_speed * self.dt)
+
+    def test_reversal_tap_is_not_swallowed(self):
+        """Встречный тап на полном ходу = разворот к клетке тапа.
+
+        Старая схема вычитала клетку из команды удержания, которая всегда
+        впереди: «влево» на полном ходу давало +2 клетки ВПЕРЁД и мгновенный
+        стоп — нажатие просто исчезало.
+        """
+        world = self.world
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        cell_at_tap = world.paddle_x
+        self.assertGreater(world.paddle_vel, 0.9 * world.paddle_speed)
+        self.tap(-1)
+        self.assertAlmostEqual(world.paddle_cmd, cell_at_tap - ark.PADDLE_KEY_STEP, places=9)
+        path = self.release_key(40)                     # тапнул и отпустил
+        self.assertLess(path[-1], float(cell_at_tap), "ракетка не поехала назад")
+        self.assertAlmostEqual(path[-1], cell_at_tap - ark.PADDLE_KEY_STEP, places=9)
+        self.assertEqual(world.paddle_vel, 0.0)
+
+    def test_reversal_overrun_is_bounded(self):
+        """Инерция при развороте есть, но она в пределах тормозного пути, и
+        разворот действительно набирает скорость в другую сторону."""
+        world = self.world
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        at_reversal = world.paddle_pos
+        self.tap(-1)
+        path = self.hold_key(-1, 12)
+        self.assertGreater(max(path), at_reversal, "разворот без проноса — это не инерция")
+        self.assertLessEqual(max(path) - at_reversal, world.paddle_braking_distance,
+                             "пронос при развороте длиннее тормозного пути")
+        self.assertLess(path[-1], at_reversal, "разворот так и не начался")
+        self.assertLess(world.paddle_vel, -0.99 * world.paddle_speed)
+
+    def test_reversal_does_not_bounce(self):
+        """После разворота — ни качания назад-вперёд: путь монотонен."""
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        self.tap(-1)
+        path = self.hold_key(-1, 20)
+        after = path[path.index(max(path)):]
+        self.assertTrue(all(b <= a + 1e-12 for a, b in zip(after, after[1:])),
+                        f"отскок при развороте: {after}")
+
+    def test_tap_along_the_way_gives_one_visible_cell(self):
+        """Тап на ходу даёт ровно одну ВИДИМУЮ клетку и без отката назад:
+        начатые полклетки засчитаны, а не обнулены."""
+        self.start_from_left_wall()
+        self.hold_key(1, 3)
+        position, cell = self.world.paddle_pos, self.world.paddle_x
+        self.assertGreater(position, cell - 0.5)  # позиция не целая — есть что засчитать
+        self.tap(1)
+        self.assertGreaterEqual(self.world.paddle_cmd, position, "тап отменил уже съеханные клетки")
+        path = self.release_key(40)
+        self.assertAlmostEqual(path[-1], self.world.paddle_cmd, places=9)
+        self.assertGreaterEqual(min(path), position - 1e-12, "ракетка откатила назад")
+        self.assertEqual(self.world.paddle_x, cell + 1)
+        self.assertEqual(self.world.paddle_vel, 0.0)
+
+    def test_tap_lands_on_the_visible_cell(self):
+        """Позиция вещественная, рисуется целая клетка: тап обязан давать клетку
+        относительно картинки, иначе нажатие выглядит проглоченным."""
+        self.world.paddle_pos = float(self.world.paddle_x) - 0.4   # «недоеденные» полклетки
+        self.world.paddle_cmd = self.world.paddle_pos
+        cell = self.world.paddle_x
+        self.tap(1)
+        self.release_key(20)
+        self.assertEqual(self.world.paddle_x, cell + 1)
+        self.assertEqual(self.world.paddle_vel, 0.0)
+
+    def test_no_crawl_after_settling(self):
+        """Встала — так встала: ни ползущих остатков, ни мигания клетки."""
+        self.world.paddle_cmd = self.world.paddle_pos + 7.5
+        self.drive(120)
+        settled, cell = self.world.paddle_pos, self.world.paddle_x
+        for _ in range(600):
+            self.drive(1)
+            self.assertEqual(self.world.paddle_pos, settled)
+            self.assertEqual(self.world.paddle_x, cell)
+            self.assertEqual(self.world.paddle_vel, 0.0)
+
+    def test_reversal_tap_holds_its_cell_until_the_turnaround(self):
+        """Пока ракета ещё едет не туда, встречающее удержание не переписывает
+        клетку тапа: тап назвал адрес, он и есть цель разворота. Иначе команда
+        удержания утянет цель влево на несколько клеток, и «тапнул и отпустил»
+        перестанет означать «клетка назад»."""
+        world = self.world
+        self.start_from_left_wall()
+        self.hold_key(1, 20)
+        cell_at_tap = world.paddle_x
+        self.tap(-1)
+        self.hold_key(-1, 1)                       # успели только начать тормозить
+        self.assertGreater(world.paddle_vel, 0.0, "за кадр разворот случиться не мог")
+        path = self.release_key(40)
+        self.assertAlmostEqual(path[-1], cell_at_tap - ark.PADDLE_KEY_STEP, places=9,
+                               msg="встречное удержание переписало клетку тапа")
+
+    def test_half_cell_always_renders_on_the_same_side(self):
+        """Полуклетка толкуется одинаково и на чётной, и на нечётной клетке:
+        built-in round округляет к чётному, и ракета на x.5 рисовалась бы то на
+        x, то на x+1 — клетка, которую игрок не может ни на что повлиять."""
+        for offset in range(5):
+            self.world.paddle_pos = self.world.paddle_min + offset + 0.5
+            self.assertEqual(self.world.paddle_x, int(self.world.paddle_min) + offset + 1)
+
+    def test_wider_paddle_at_the_wall_stays_inside(self):
+        """Бонус «шире», пойманный у стенки, не выталкивает ракетку за поле:
+        границы сузились — ракета возвращается внутрь, а не висит в стене."""
+        world = self.world
+        self.hold_key(1, 200)                            # упор в правую стенку
+        self.assertAlmostEqual(world.paddle_pos, world.paddle_max, places=9)
+        ark.apply_powerup(world, "E", [])                # право теперь на 2 клетки меньше
+        limit = world.field_right - world.paddle_width + 1
+        path = self.release_key(30)
+        self.assertLessEqual(world.paddle_x, limit)
+        self.assertTrue(all(p <= limit + 0.5 for p in path), "ракетка осталась за стеной")
+        self.assertEqual(world.paddle_vel, 0.0)
+
+    def test_rendered_cell_advances_in_bounded_steps(self):
+        """Клетка на экране прибавляется монотонно и не больше, чем на шаг
+        полной скорости: движение видно целиком, без пропусков и рывков."""
+        world = self.world
+        self.start_from_left_wall()
+        previous, steps = world.paddle_x, []
+        for direction, frames in ((1, 12), (0, 20)):        # разгон, полка, съезд
+            for _ in range(frames):
+                world.paddle_dir = direction
+                ark.move_paddle(world, self.dt)
+                steps.append(world.paddle_x - previous)
+                previous = world.paddle_x
+        limit = world.paddle_speed * self.dt + 1.0          # худший кадр + приземление
+        self.assertTrue(all(0 <= step <= limit for step in steps), f"клетка скачет: {steps}")
+
 
 class KeyRepeatTest(unittest.TestCase):
     """Тап и удержание различаются по интервалу автоповтора терминала."""
@@ -416,9 +676,7 @@ class KeyRepeatTest(unittest.TestCase):
             while sent and sent[0][0] <= now:
                 moment, direction = sent.pop(0)             # (момент, направление)
                 if not tracker.press(direction, now):        # тап: ровно клетка
-                    world.paddle_cmd = float(ark.clamp(
-                        world.paddle_cmd + direction * ark.PADDLE_KEY_STEP,
-                        world.paddle_min, world.paddle_max))
+                    ark.tap_paddle(world, direction)         # теми же кодом, что и игра
             world.paddle_dir = tracker.active_direction(now)
             ark.move_paddle(world, dt)
         return world, tracker
@@ -496,6 +754,42 @@ class KeyRepeatTest(unittest.TestCase):
         self.assertTrue(tracker.press(1, 0.03))
         self.assertFalse(tracker.press(-1, 0.06), "смена направления — не повтор")
         self.assertEqual(tracker.direction, -1)
+
+    def test_reversal_while_holding_moves_the_paddle_back(self):
+        """Разворот не должен теряться между трекером и физикой.
+
+        Держали вправо, нажали влево и держат дальше: первый встречный код — тап
+        (трекер обязан погасить старую серию), второй — уже удержание. Ракетка
+        разворачивается и едет назад, а не доедает старый зазор команды.
+        """
+        world = make_world(80, 24)
+        world.paddle_pos = world.paddle_min
+        world.paddle_cmd = world.paddle_min
+        world.paddle_vel = 0.0
+        dt = 1 / 60
+        tracker = ark.KeyRepeatTracker()
+
+        def key(direction, now):
+            if not tracker.press(direction, now):
+                ark.tap_paddle(world, direction)
+
+        for frame in range(20):                       # 1/3 с держим вправо (30 Гц)
+            now = frame * dt
+            if frame % 2 == 0:
+                key(1, now)
+            world.paddle_dir = tracker.active_direction(now)
+            ark.move_paddle(world, dt)
+        self.assertGreater(world.paddle_vel, 0.9 * world.paddle_speed)
+        turnaround = world.paddle_pos
+
+        for frame in range(20, 32):               # держим влево
+            now = frame * dt
+            if frame % 2 == 0:
+                key(-1, now)
+            world.paddle_dir = tracker.active_direction(now)
+            ark.move_paddle(world, dt)
+        self.assertLess(world.paddle_vel, 0.0, "встречное удержание не развернуло ракетку")
+        self.assertLess(world.paddle_pos, turnaround, "разворот кончился проносом вперёд")
 
 
 class KeyDecoderTest(unittest.TestCase):
