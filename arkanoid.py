@@ -5,7 +5,12 @@
 Запуск:
     python arkanoid.py
     python arkanoid.py --fps 60 --lives 5 --seed 42 --no-sound
-    python arkanoid.py --smoke 30     # проверка физики без терминала
+    python arkanoid.py --arena-width 60   # поле уже терминала -> уровни короче
+    python arkanoid.py --smoke 30         # проверка физики без терминала
+
+Поле по умолчанию занимает весь терминал: скорость шарика, ширина ракетки и
+толщина стены считаются из размеров окна (формулу и обоснование смотри в
+README).
 
 Управление:
     ← →  (или h/l) — движение ракетки, удержание работает
@@ -32,20 +37,43 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # --- Арена -----------------------------------------------------------------
-# Поле сознательно ограничено по размеру: на терминале 200x60 «арканоид»
-# превращается в бесконечное блуждание шарика, и уровень нельзя пройти.
-ARENA_MAX_WIDTH = 40    # внутренняя ширина поля
-ARENA_MAX_HEIGHT = 16   # внутренняя высота поля
+# Поле занимает весь терминал: только что не хватает на минимальную игру.
+ARENA_MIN_WIDTH = 14    # внутренних колонок
+ARENA_MIN_HEIGHT = 9    # внутренних строк
+# От этой диагонали арены масштабируется скорость и толщина стены:
+# базовый терминал 80x24 (арена ~40x16), всё остальное — пропорционально.
+REFERENCE_DIAGONAL = 43.0
+SPEED_SCALE = (0.85, 5.0)     # границы масштаба скорости
+MIN_REACTION_SECONDS = 0.35   # за сколько секунд шарик должен пролетать высоту поля
+# Законы жанра (замерены на симуляции): время пробоя стены это
+# ~0.5 * ширина_поля * ряды * плотность, и почти не зависит от скорости шарика
+# (быстрее шарик — чаще подлёты, но и кирпичей на уровне больше). Значит
+# толщину и густоту стены надо считать из размера поля, иначе на 200x60
+# уровень превращается в пятиминутное перебирание кирпичей.
+LEVEL_SECONDS = 80.0        # целевое время пробоя стены; на очень широких полях
+LEVEL_GROWTH = 0.25         # floor уровня меньше не станет — см. заметку ниже
+MAX_VX = 2                  # классический предел угла: дальше шарик не перехватить ракеткой
+
+# Время пробоя уровня (замерено и выведено):
+#
+#       время ≈ ширина_поля * прочность_кирпича * (2 * высота_поля / скорость)
+#
+# Ряды и густота кладки на него НЕ влияют: за один подлёт шарик проходит по
+# клетке в каждом ряду, и сколько из них окажутся кирпичами — столько он и
+# выбьет; произведение «кирпичей» и «шанса попасть» как раз сворачивается в
+# ширину поля. Поэтому толщина стены — это про сложность и внешний вид, а
+# скорость шарика — про темп игры (см. --speed и --arena-width).
+PADDLE_WIDTH_DIVISOR = 12     # ширина ракетки от ширины поля
 
 # --- Скорости (клеток в секунду) -------------------------------------------
 BALL_SPEED = 18.0       # базовая скорость шарика
 BALL_SPEED_PER_LEVEL = 1.5
 BALL_SPEED_MAX = 34.0
-PADDLE_SPEED = 34.0
+PADDLE_TO_BALL = 2.6    # запас по скорости ракетки относительно шарика (у шарика |vx| до 2)
 POWERUP_SPEED = 7.0
 MAX_STEPS_PER_FRAME = 4  # страховка от «телепорта» при просадке FPS
 
-STALL_SECONDS = 12.0    # если кирпичей нет так долго — слегка рулим шариком
+STALL_SECONDS = 5.0     # столько секунд без кирпича считаем «залипанием» и рулим к кирпичам
 
 # --- Начисление очков -------------------------------------------------------
 POINTS_BRICK = 10
@@ -69,10 +97,10 @@ FALLBACK_GLYPHS = {
 # Строки тайлятся по ширине окна, поэтому уровень годится для любого терминала.
 LEVELS = [
     ("#####", "#.#.#"),
-    ("#%#%#", "#.%.#", "#####"),
-    ("&.%.#", "#.&.%", "%.#.&", "....."),
-    ("#####", "%%%%%", "&.#.&", ".....", "#.#.#"),
-    ("&.&.&", "%%%%%", "#.#.#", "&%&#%", "....."),
+    ("#%#%#", "#...#", "#####"),
+    ("&.#.%", "#.#.#", "%.###", "#...#"),
+    ("#####", "#%#%#", "&.#.#", ".....", "#.#.#"),
+    ("#.&.#", "%%#%#", "#.#.#", "&.#.%", "....."),
 ]
 
 # Вид бонусов: код -> (символ на поле, расшифровка для README)
@@ -100,15 +128,27 @@ class Arena:
     bottom: int = 10
 
     @classmethod
-    def fit(cls, width: int, height: int) -> "Arena":
-        inner_w = max(14, min(width - 2, ARENA_MAX_WIDTH))
-        inner_h = max(9, min(height - 4, ARENA_MAX_HEIGHT))
+    def fit(cls, width: int, height: int, max_width: int | None = None) -> "Arena":
+        """
+        Арена во весь терминал: минус строка счёта, минус подсказки внизу.
+
+        max_width нужен тем, кто играет на огромном терминале, но не хочет
+        длинных уровней: время пробоя пропорционально ширине поля.
+        """
+        inner_w = max(ARENA_MIN_WIDTH, width - 2)
+        if max_width:
+            inner_w = min(inner_w, max(ARENA_MIN_WIDTH, max_width))
+        inner_h = max(ARENA_MIN_HEIGHT, height - 4)
 
         left = max(0, (width - inner_w) // 2 - 1)
         right = min(width - 1, left + inner_w + 1)
-        top = 1 + max(0, (height - 4 - inner_h) // 2)
+        top = 1
         bottom = min(height - 1, top + inner_h + 1)
         return cls(left=left, right=right, top=top, bottom=bottom)
+
+    @property
+    def diagonal(self) -> float:
+        return (self.inner_width**2 + self.play_rows**2) ** 0.5
 
     @property
     def inner_left(self) -> int:
@@ -157,6 +197,8 @@ class Config:
     fps: int = 60
     lives: int = 3
     paddle_width: int = 7
+    level_seconds: float = LEVEL_SECONDS
+    max_arena_width: int | None = None   # None = во весь терминал
     ball_speed: float = BALL_SPEED
     sound: bool = True
     color: bool = True
@@ -203,6 +245,9 @@ class World:
     over: bool = False
 
     bricks: list[list[int]] = field(default_factory=list)
+    brick_rows: int = 1
+    brick_cols: int = 1
+    brick_left: int = 1
     balls: list[Ball] = field(default_factory=list)
     powerups: list[PowerUp] = field(default_factory=list)
 
@@ -212,6 +257,7 @@ class World:
 
     combo: int = 0
     speed: float = BALL_SPEED
+    level_seconds: float = LEVEL_SECONDS
     effects: dict[str, float] = field(default_factory=dict)
     since_brick: float = 0.0
 
@@ -219,16 +265,75 @@ class World:
         if self.cfg.seed is not None:
             self.rng = random.Random(self.cfg.seed)
         self.lives = self.cfg.lives
-        self.speed = self.cfg.ball_speed
-        self.arena = Arena.fit(self.width, self.height)
-        self.paddle_pos = float(self.arena.inner_left + (self.arena.inner_width - self.cfg.paddle_width) // 2)
+        self.arena = Arena.fit(self.width, self.height, self.cfg.max_arena_width)
+        self.level_seconds = self.cfg.level_seconds
+        self.speed = self.level_speed(self.level)
+        self.brick_rows, self.brick_cols, self.brick_left, _keep, _max_hp = self.brick_layout()
+        self.bricks = []
         self.reset_level()
+        self.paddle_pos = float(
+            self.arena.inner_left + max(0, (self.arena.inner_width - self.paddle_width) // 2)
+        )
         self.spawn_ball()
 
     # --- геометрия ---------------------------------------------------------
     @property
     def paddle_x(self) -> int:
         return int(round(self.paddle_pos))
+
+    @property
+    def size_scale(self) -> float:
+        """Во сколько раз эта арена больше базовой (40x16).
+
+        Скорость шарика и ширина ракетки масштабируются от него, иначе на
+        терминале 200x60 шарик ползает, а на 50x14 — непотопляемо быстр.
+        """
+        raw = self.arena.diagonal / REFERENCE_DIAGONAL
+        return max(SPEED_SCALE[0], min(SPEED_SCALE[1], raw))
+
+    def level_speed(self, level: int) -> float:
+        """
+        Скорость шарика: базовый масштаб от размера поля, но на широких полях
+        ещё и разгон, чтобы «прочёсывание» успевало за бюджет уровня. Выше
+        MIN_REACTION_SECONDS не прыгаем — дальше реакция игрока не успевает.
+        """
+        base = (self.cfg.ball_speed + BALL_SPEED_PER_LEVEL * (level - 1)) * self.size_scale
+        field = max(1, self.arena.inner_width) * 2 * max(1, self.arena.play_rows)
+        needed = field / max(1.0, self.level_seconds)
+        capable = max(1, self.arena.play_rows) / MIN_REACTION_SECONDS
+        return max(base, min(needed, capable))
+
+    @property
+    def paddle_speed(self) -> float:
+        """Ракетка успевает за шариком: запас PADDLE_TO_BALL к его скорости."""
+        return PADDLE_TO_BALL * self.speed
+
+    @property
+    def max_vx(self) -> int:
+        """
+        Самый крутой горизонтальный угол шарика (в клетках на один ряд).
+
+        Больше двух нельзя: горизонтальная скорость шарика становится выше
+        скорости ракетки, и её нечем отбить — проверено симуляцией, при |vx| = 4
+        «игрок» теряет по 90 жизней в минуту.
+        """
+        return MAX_VX
+
+    @property
+    def min_vx(self) -> int:
+        return 1
+
+    @property
+    def sweep_seconds(self) -> float:
+        """Время одного полного «прочёсывания» поля: width * (2*height/speed)."""
+        return max(1, self.arena.inner_width) * 2 * max(1, self.arena.play_rows) / max(1.0, self.speed)
+
+    @property
+    def estimated_level_seconds(self) -> float:
+        """Сколько секунд займёт пробой стены: одно «прочёсывание» поля на прочность."""
+        hp = [value for row in self.bricks for value in row if value]
+        strength = sum(hp) / len(hp) if hp else 1
+        return strength * self.sweep_seconds
 
     @property
     def paddle_y(self) -> int:
@@ -257,7 +362,8 @@ class World:
 
     @property
     def paddle_width(self) -> int:
-        return self.cfg.paddle_width + (2 if self.effects.get("E", 0) > 0 else 0)
+        base = max(self.cfg.paddle_width, round(self.arena.inner_width / PADDLE_WIDTH_DIVISOR))
+        return base + (2 if self.effects.get("E", 0) > 0 else 0)
 
     @property
     def ball_speed_now(self) -> float:
@@ -265,22 +371,40 @@ class World:
         return self.speed * factor
 
     # --- уровни ------------------------------------------------------------
+    def brick_layout(self) -> tuple[int, int, int, float]:
+        """
+        Ряды, колонки, отступ и плотность кладки текущего уровня.
+
+        Стена всегда во всю ширину поля — так она выглядит правильно на любом
+        терминале. А «объём» уровня считается из размеров поля: время чистки
+        это занятые колонки, делённые на подлёты в секунду. Поэтому на 40x14
+        кладка глухая, а на 200x60 — дырявая, зато уровень везде проходится
+        за одно и то же время.
+        """
+        inner_w = self.arena.inner_width
+        max_rows = max(1, (self.arena.play_rows - 3) // 2)
+
+        # Ряды и плотность — внешний вид и сложность: сквозь дыру в стене шарик
+        # летит дальше, поэтому время уровня держится ~sweep_seconds и от толщины
+        # стены почти не зависит. А вот крепкий кирпич (%) дорогой: каждый его
+        # уровень прочности стоит отдельного подлёта, так что максимум прочности
+        # ограничиваем по бюджету времени.
+        rows = max(1, min(max_rows, 1 + self.level // 2))
+        keep = min(1.0, 0.6 + 0.13 * (self.level - 1))
+
+        budget = self.level_seconds * (1 + LEVEL_GROWTH * (self.level - 1)) / self.sweep_seconds
+        max_hp = 3 if budget >= 2.6 else 2 if budget >= 1.4 else 1
+        return rows, inner_w, self.arena.inner_left, keep, max_hp
+
     def reset_level(self) -> None:
-        """Собирать кирпичи заново (размер окна может отличаться от прошлого)."""
-        rows, cols = self.brick_grid_size()
+        """Собрать кирпичи заново (размер окна мог измениться)."""
+        self.brick_rows, self.brick_cols, self.brick_left, keep, max_hp = self.brick_layout()
         layout = LEVELS[(self.level - 1) % len(LEVELS)]
         self.bricks = []
-        for r in range(rows):
+        for r in range(self.brick_rows):
             pattern = layout[r % len(layout)]
-            self.bricks.append(
-                [BRICK_HP_BY_CHAR.get(pattern[c % len(pattern)], 0) for c in range(cols)]
-            )
-
-    def brick_grid_size(self) -> tuple[int, int]:
-        # Ряды тайлятся сверху вниз, поэтому уровень можно «развернуть» на любую
-        # высоту: чем выше уровень, тем толще стена (и тем быстрее шарик).
-        rows = min(2 + self.level // 2, (self.arena.play_rows - 3) // 2)
-        return max(1, rows), self.arena.inner_width
+            row = [min(max_hp, BRICK_HP_BY_CHAR.get(pattern[c % len(pattern)], 0)) for c in range(self.brick_cols)]
+            self.bricks.append(thin_row(row, keep, r))
 
     def bricks_left(self) -> bool:
         return any(cell for row in self.bricks for cell in row)
@@ -306,14 +430,14 @@ class World:
         for ball in self.balls:
             if ball.stuck:
                 ball.stuck = False
-                ball.vx = self.rng.choice((-1, 1))
+                ball.vx = self.rng.choice((-1, 1)) * self.max_vx
                 ball.vy = -1
                 launched = True
         return launched
 
     def next_level(self) -> None:
         self.level += 1
-        self.speed = min(BALL_SPEED_MAX, self.cfg.ball_speed + BALL_SPEED_PER_LEVEL * (self.level - 1))
+        self.speed = self.level_speed(self.level)
         self.balls = []
         self.powerups = []
         self.reset_level()
@@ -322,6 +446,21 @@ class World:
 
 def new_world(width: int, height: int, cfg: Config) -> World:
     return World(width=width, height=height, cfg=cfg)
+
+
+def thin_row(row: list[int], keep: float, row_index: int) -> list[int]:
+    """
+    Оставить в ряду примерно долю `keep` кирпичей, равномерно и вразнобой.
+
+    Сдвиг фазы по номеру ряда даёт «кирпичную» кладку, а не вертикальные полосы.
+    """
+    if keep >= 1.0:
+        return row
+
+    count = max(1, round(len(row) * keep))
+    step = len(row) / count
+    wanted = {int(col * step + step / 2 + row_index * step / 2) % len(row) for col in range(count)}
+    return [hp if col in wanted else 0 for col, hp in enumerate(row)]
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +472,7 @@ Event = str
 def brick_row_col(world: World, x: int, y: int) -> tuple[int, int] | None:
     """Индекс ряда/колонки кирпича по координатам поля (или None)."""
     row = y - world.brick_top
-    col = x - world.left
+    col = x - world.brick_left
     if 0 <= row < len(world.bricks) and 0 <= col < len(world.bricks[row]):
         return row, col
     return None
@@ -386,14 +525,16 @@ def paddle_bounce(world: World, ball: Ball) -> int:
     и бесконечные очки (баг прошлой версии). А два разных угла ломают
     периодическую траекторию, в которую шарик иначе залетает надолго.
     """
-    half = max(1, world.paddle_width // 2 - 1)
+    half = max(1, world.paddle_width // 2)
     offset = ball.x - (world.paddle_x + world.paddle_width // 2)
+    span = max(1, world.max_vx)
 
-    if abs(offset) >= half:
-        return (2 if abs(offset) >= half + 1 else 1) * (1 if offset > 0 else -1)
-    if abs(ball.vx) == 1:
-        return ball.vx
-    return 1 if ball.vx > 0 else -1
+    if offset == 0:                               # точно в центр — угол не трогаем
+        return ball.vx or 1
+
+    magnitude = span if abs(offset) >= half else 1 + round(abs(offset) / half * (span - 1))
+    magnitude = max(world.min_vx, min(span, magnitude))
+    return magnitude * (1 if offset > 0 else -1)
 
 
 def move_x(world: World, ball: Ball, events: list[Event]) -> bool:
@@ -514,10 +655,10 @@ def move_paddle(world: World, dt: float) -> None:
     """Ракетка: удержание клавиши или плавное следование за мышью."""
     if world.paddle_target is not None:
         delta = world.paddle_target - world.paddle_pos
-        step = PADDLE_SPEED * dt
+        step = world.paddle_speed * dt
         world.paddle_pos += max(-step, min(step, delta))
     else:
-        world.paddle_pos += world.paddle_dir * PADDLE_SPEED * dt
+        world.paddle_pos += world.paddle_dir * world.paddle_speed * dt
 
     world.paddle_pos = float(
         clamp(world.paddle_pos, world.left, max(world.left, world.field_right - world.paddle_width + 1))
@@ -535,23 +676,46 @@ def tick_effects(world: World, dt: float) -> None:
             del world.effects[kind]
 
 
+def nearest_brick_column(world: World, x: int) -> int | None:
+    """Ближайшая колонка с целым кирпичом — куда стоит довернуть шарик."""
+    best: tuple[int, int] | None = None
+    for row in world.bricks:
+        for col, hp in enumerate(row):
+            if hp > 0:
+                candidate = world.brick_left + col
+                distance = abs(candidate - x)
+                if best is None or distance < best[0]:
+                    best = (distance, candidate)
+    return best[1] if best else None
+
+
 def anti_stall(world: World, dt: float, events: list[Event]) -> None:
     """
-    Если шарик долго не трогает кирпичи — меняем ему наклон.
+    Подстраховка: если шарик долго летает впустую, доворачиваем его к кирпичам.
 
-    Знак vx менять мало: траектория отражается зеркально и тот же цикл
-    повторяется. А вот переход 1 <-> 2 меняет наклон и выводит шарик
-    из «орбиты» между пустыми колонками.
+    Без этого последние кирпичи превращаются в лотерею — на широком поле
+    шарик может десятки секунд носиться между пустыми колонками (и знакомая
+    по-настоящемуму арканоиду «орбита» тоже никуда не денется). Знак vx менять
+    мало — траектория просто отразится зеркально, поэтому целимся в конкретную
+    колонку и попутно меняем наклон (|vx| 1 <-> 2).
     """
     world.since_brick += dt
     if world.since_brick < STALL_SECONDS:
         return
     world.since_brick = 0.0
     for ball in world.balls:
-        if not ball.stuck and not ball.dead:
-            ball.vx = (1 if abs(ball.vx) == 2 else 2) * world.rng.choice((-1, 1))
-            events.append("nudge")
-            break
+        if ball.stuck or ball.dead:
+            continue
+        target = nearest_brick_column(world, ball.x)
+        if target is None:
+            return
+        if abs(target - ball.x) <= 1:
+            ball.vy = -1                       # уже над ним — идём вверх
+        else:
+            step = 1 if abs(ball.vx) >= world.max_vx else world.max_vx
+            ball.vx = step * (1 if target > ball.x else -1)
+        events.append("nudge")
+        return
 
 
 def advance(world: World, dt: float) -> list[Event]:
@@ -595,7 +759,8 @@ def resize(world: World, width: int, height: int) -> None:
         return
 
     world.width, world.height = width, height
-    world.arena = Arena.fit(width, height)
+    world.arena = Arena.fit(width, height, world.cfg.max_arena_width)
+    world.speed = world.level_speed(world.level)
     world.paddle_pos = float(
         clamp(world.paddle_pos, world.left, max(world.left, world.field_right - world.paddle_width + 1))
     )
@@ -798,7 +963,7 @@ class Renderer:
             y = world.brick_top + row_index
             for col_index, hp in enumerate(row):
                 if hp > 0:
-                    self.put(y, world.left + col_index, self.glyph["brick"].get(hp, "#"),
+                    self.put(y, world.brick_left + col_index, self.glyph["brick"].get(hp, "#"),
                              self.attr["brick"].get(hp, self.attr["brick"][1]))
 
         for item in world.powerups:
@@ -1053,7 +1218,19 @@ class Game:
 # ---------------------------------------------------------------------------
 # Прогон физики без терминала: python arkanoid.py --smoke 30
 # ---------------------------------------------------------------------------
-def run_smoke(seconds: float, cfg: Config) -> int:
+def aim_ai_paddle(world: World) -> None:
+    """
+    Болван игрока для тестов: догоняет шарик ракеткой. Идеальный — зато
+    проверяет худший случай: ракетка не помогает шарику «собирать» кирпичи,
+    и вся надежда на анти-залипание.
+    """
+    if not world.balls:
+        return
+    ball = world.balls[0]
+    world.paddle_target = ball.x - world.paddle_width / 2
+
+
+def run_smoke(seconds: float, cfg: Config, width: int = 80, height: int = 24) -> int:
     """
     Инварианты, зафиксированные по мотивам багов прошлой версии:
 
@@ -1062,7 +1239,7 @@ def run_smoke(seconds: float, cfg: Config) -> int:
       3. ракетка не выезжает за границы;
       4. игра реально прогрессирует (кирпичи разбиваются, жизни теряются).
     """
-    world = new_world(80, 24, cfg)
+    world = new_world(width, height, cfg)
     step = 1.0 / cfg.fps
     frames = int(seconds * cfg.fps)
     broken = 0
@@ -1071,12 +1248,9 @@ def run_smoke(seconds: float, cfg: Config) -> int:
     problems: list[str] = []
 
     for frame in range(frames):
-        ball = world.balls[0] if world.balls else None
-        if ball is not None:
-            # неидеальный «игрок»: наводит ракетку с запаздыванием
-            world.paddle_target = ball.x - world.paddle_width / 2
-            if ball.stuck:
-                world.launch()
+        aim_ai_paddle(world)
+        if world.balls and world.balls[0].stuck:
+            world.launch()
         events = advance(world, step)
         broken += events.count("brick_break")
         levels += events.count("level")
@@ -1095,8 +1269,10 @@ def run_smoke(seconds: float, cfg: Config) -> int:
             world = new_world(world.width, world.height, replace(cfg, seed=None))
 
     print(
-        f"прогон {seconds:.0f} с ({frames} шагов): очков {world.score}, разбито {broken}, "
-        f"уровней пройдено {levels}, жизней потеряно {lives_lost}"
+        f"прогон {seconds:.0f} с на {width}x{height} (арена {world.arena.inner_width}x{world.arena.play_rows}, "
+        f"стена {world.brick_cols}x{world.brick_rows}, скорость {world.speed:.0f}, "
+        f"пробой ~{world.estimated_level_seconds:.0f} с): "
+        f"очков {world.score}, разбито {broken}, уровней пройдено {levels}, жизней потеряно {lives_lost}"
     )
     for problem in problems[:10]:
         print("ПРОБЛЕМА:", problem)
@@ -1120,6 +1296,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-sound", action="store_true", help="без звука")
     parser.add_argument("--no-color", action="store_true", help="монохромный режим")
     parser.add_argument("--no-powerups", action="store_true", help="без бонусов")
+    parser.add_argument("--size", metavar="WxH", default=None,
+                        help="размер поля для --smoke (по умолчанию 80x24)")
+    parser.add_argument("--level-seconds", type=float, default=Config.level_seconds,
+                        help="целевое время пробоя стены (на широких полях есть физический минимум)")
+    parser.add_argument("--arena-width", type=int, default=None, metavar="N",
+                        help="ограничить ширину поля N колонками (по умолчанию — весь терминал); "
+                             "уже поле — короче уровни")
     parser.add_argument(
         "--smoke", type=float, metavar="SECONDS", default=None,
         help="прогнать физику без терминала и проверить инварианты",
@@ -1135,6 +1318,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         sound=not args.no_sound,
         color=not args.no_color,
         powerups=not args.no_powerups,
+        level_seconds=max(20.0, args.level_seconds),
+        max_arena_width=args.arena_width,
         seed=args.seed,
     )
 
@@ -1154,12 +1339,24 @@ def run_game(stdscr, cfg: Config) -> None:
     Game(stdscr, cfg).run()
 
 
+def parse_size(text: str | None) -> tuple[int, int]:
+    """Размер '120x40' для --smoke; по умолчанию 80x24."""
+    if not text:
+        return 80, 24
+    try:
+        width, _, height = text.lower().partition("x")
+        return max(20, int(width)), max(12, int(height))
+    except ValueError:
+        raise SystemExit("--size нужен вида 120x40")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cfg = config_from_args(args)
 
     if args.smoke is not None:
-        return run_smoke(args.smoke, cfg)
+        width, height = parse_size(args.size)
+        return run_smoke(args.smoke, cfg, width, height)
 
     # Без этой строки при LANG=C curses рисует кириллицу пробелами (проверено в pty).
     try:
