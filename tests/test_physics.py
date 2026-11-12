@@ -1,5 +1,6 @@
 """Тесты физики арканоида — без терминала: python -m unittest discover -s tests"""
 
+import curses
 import os
 import sys
 import tempfile
@@ -50,7 +51,8 @@ class PhysicsTest(unittest.TestCase):
                 for ball in world.balls:
                     if ball.stuck:
                         continue
-                    self.assertIn(abs(ball.vx), (1, 2), "шарик встал вертикально")
+                    self.assertLessEqual(abs(ball.vx), world.max_vx)
+                    self.assertGreaterEqual(abs(ball.vx), 1, "шарик встал вертикально")
                     self.assertIn(ball.vy, (-1, 1))
                 ark.advance(world, 1 / 60)
 
@@ -284,6 +286,273 @@ class PhysicsTest(unittest.TestCase):
             self.assertEqual(ark.load_record(path), 1234)
             path.write_text("не число")
             self.assertEqual(ark.load_record(path), 0)
+
+
+class PaddleMotionTest(unittest.TestCase):
+    """Ракетка должна ехать плавно (с разгоном и торможением) и вставать точно."""
+
+    def setUp(self):
+        self.world = make_world(80, 24)
+        self.dt = 1 / 60
+        self.world.paddle_pos = float(self.world.paddle_x)
+        self.world.paddle_cmd = self.world.paddle_pos
+        self.world.paddle_vel = 0.0
+
+    def drive(self, frames: int) -> list[float]:
+        path = []
+        for _ in range(frames):
+            ark.follow_paddle_command(self.world, self.dt)
+            path.append(self.world.paddle_pos)
+        return path
+
+    def test_tap_moves_exactly_one_cell_and_stops(self):
+        start = self.world.paddle_pos
+        self.world.paddle_cmd = start + ark.PADDLE_KEY_STEP
+        self.drive(20)
+        self.assertAlmostEqual(self.world.paddle_pos, start + 1, places=9)
+        self.assertEqual(self.world.paddle_vel, 0.0)
+
+    def test_ten_taps_land_on_the_tenth_cell(self):
+        start = self.world.paddle_pos
+        for _ in range(10):
+            self.world.paddle_cmd += ark.PADDLE_KEY_STEP
+            self.drive(2)                    # два кадра между тапами: автоповтор
+        self.assertAlmostEqual(self.world.paddle_pos, start + 10, places=9)
+
+    def test_start_is_not_a_jump(self):
+        """Первый кадр медленнее второго: ракета разгоняется, а не телепортируется."""
+        self.world.paddle_cmd = self.world.paddle_pos + 30
+        path = self.drive(12)
+        steps = [path[0] - self.world.paddle_pos] + [b - a for a, b in zip(path, path[1:])]
+        self.assertLess(steps[0], steps[1])
+        self.assertLess(steps[1], steps[-1])          # разгон до полки
+        self.assertLessEqual(max(steps), self.world.paddle_speed * self.dt + 1e-9)
+
+    def test_brakes_exactly_on_target_without_overshoot(self):
+        target = self.world.paddle_pos + 25
+        self.world.paddle_vel = self.world.paddle_speed    # летим на полном ходу
+        self.world.paddle_cmd = target
+        overshoot = 0.0
+        for _ in range(200):
+            ark.follow_paddle_command(self.world, self.dt)
+            overshoot = max(overshoot, self.world.paddle_pos - target)
+        self.assertLessEqual(overshoot, 1e-9, "ракета проскочила цель")
+        self.assertAlmostEqual(self.world.paddle_pos, target, places=9)
+        self.assertEqual(self.world.paddle_vel, 0.0)
+
+    def test_no_jitter_around_the_target(self):
+        self.world.paddle_cmd = self.world.paddle_pos + 7.5
+        self.drive(120)
+        settled = self.world.paddle_pos
+        self.drive(300)
+        self.assertAlmostEqual(self.world.paddle_pos, settled, places=9)
+
+    def start_from_left_wall(self):
+        world = self.world
+        world.paddle_pos = world.paddle_min
+        world.paddle_cmd = world.paddle_min
+        world.paddle_vel = 0.0
+
+    def test_holding_key_reaches_full_speed(self):
+        self.start_from_left_wall()
+        per_frame = []
+        previous = self.world.paddle_pos
+        for _ in range(20):                                     # 20 кадров удержания
+            self.world.paddle_cmd += self.world.paddle_speed * self.dt
+            ark.follow_paddle_command(self.world, self.dt)
+            per_frame.append(self.world.paddle_pos - previous)
+            previous = self.world.paddle_pos
+        self.assertLess(per_frame[0], per_frame[-1], "должен быть разгон")
+        self.assertAlmostEqual(per_frame[-1], self.world.paddle_speed * self.dt, places=6)
+
+    def test_release_glides_to_a_stop_instead_of_jerking(self):
+        """Отпущенная клавиша: ракета дотормаживает и встаёт, без возврата назад."""
+        world = self.world
+        self.start_from_left_wall()
+        world.paddle_dir = 1
+        for _ in range(20):                       # держим клавишу — разгон и полка
+            ark.move_paddle(world, self.dt)
+        self.assertGreater(world.paddle_vel, 0.0, "ракета должна быть в ходу")
+
+        speed_at_release = world.paddle_vel
+        release_pos = world.paddle_pos
+        world.paddle_dir = 0                      # отпустили
+        path = []
+        for _ in range(80):
+            ark.move_paddle(world, self.dt)
+            path.append(world.paddle_pos)
+
+        glide = path[-1] - release_pos
+        self.assertGreater(glide, 0.0, "ракета должна проскользить, а не рубить ход")
+        self.assertLessEqual(glide, speed_at_release**2 / (2 * world.paddle_accel) + 0.05)
+        self.assertEqual(world.paddle_vel, 0.0)
+        self.assertTrue(all(b >= a - 1e-9 for a, b in zip(path, path[1:])),
+                        "ракета не должна разворачиваться назад после отпускания")
+
+    def test_paddle_stays_inside_arena_while_running(self):
+        world = self.world
+        for direction in (-1, 1):
+            world.paddle_vel = 0.0
+            for _ in range(600):
+                world.paddle_cmd = float(direction * 1000)
+                ark.follow_paddle_command(world, self.dt)
+            self.assertGreaterEqual(world.paddle_pos, world.paddle_min)
+            self.assertLessEqual(world.paddle_pos, world.paddle_max)
+            self.assertEqual(world.paddle_vel, 0.0)
+
+
+class KeyRepeatTest(unittest.TestCase):
+    """Тап и удержание различаются по интервалу автоповтора терминала."""
+
+    def simulate(self, presses, seconds=2.0, world=None):
+        """Прогон кадров так же, как main-loop: dir из трекера, физика шаг за шагом."""
+        world = world or make_world(80, 24)
+        tracker = ark.KeyRepeatTracker()
+        dt = 1 / 60
+        frames = int(seconds * 60)
+        sent = list(presses)
+        for frame in range(frames):
+            now = frame * dt
+            while sent and sent[0][0] <= now:
+                moment, direction = sent.pop(0)             # (момент, направление)
+                if not tracker.press(direction, now):        # тап: ровно клетка
+                    world.paddle_cmd = float(ark.clamp(
+                        world.paddle_cmd + direction * ark.PADDLE_KEY_STEP,
+                        world.paddle_min, world.paddle_max))
+            world.paddle_dir = tracker.active_direction(now)
+            ark.move_paddle(world, dt)
+        return world, tracker
+
+    def repeat_stream(self, direction, hz, seconds, start=0.0):
+        step = 1 / hz
+        moments, moment = [], start
+        while moment <= seconds:
+            moments.append((moment, direction))
+            moment += step
+        return moments
+
+    def test_single_tap_moves_exactly_one_cell(self):
+        world = make_world(80, 24)
+        world.paddle_pos = world.paddle_min
+        world.paddle_cmd = world.paddle_min
+        start = world.paddle_pos
+        # одно нажатие и тишина 1 с — регрессия на «уехала на 20 клеток от тапа»
+        world, _ = self.simulate([(0.0, 1)], seconds=1.0, world=world)
+        self.assertAlmostEqual(world.paddle_pos, start + ark.PADDLE_KEY_STEP, places=6)
+        self.assertEqual(world.paddle_vel, 0.0)
+
+    def test_ten_single_taps_land_on_tenth_cell(self):
+        world = make_world(80, 24)
+        world.paddle_pos = world.paddle_min
+        world.paddle_cmd = world.paddle_min
+        start = world.paddle_pos
+        presses = [(i * 0.5, 1) for i in range(10)]           # редкие тапы, не повтор
+        world, _ = self.simulate(presses, seconds=5.5, world=world)
+        self.assertAlmostEqual(world.paddle_pos, start + 10, places=6)
+
+    def test_hold_at_30hz_gives_continuous_motion(self):
+        world = make_world(80, 24)
+        world.paddle_pos = world.paddle_min
+        world.paddle_cmd = world.paddle_min
+        world, tracker = self.simulate(self.repeat_stream(1, 30, 1.0), seconds=1.0, world=world)
+        self.assertAlmostEqual(tracker.gap, 1 / 30, places=4)
+        # за секунду удержания ракета должна проехать почти всё поле
+        self.assertGreater(world.paddle_pos, world.paddle_max - world.paddle_width,
+                           "удержание клавиши должно давать сплошной ход")
+
+    def test_hold_on_slow_terminal_does_not_stutter(self):
+        """Автоповтор 6 Гц (SSH): окно удержания подстраивается, провалов нет."""
+        world = make_world(80, 24)
+        world.paddle_pos = world.paddle_min
+        world.paddle_cmd = world.paddle_min
+        dt = 1 / 60
+        tracker = ark.KeyRepeatTracker()
+        world.paddle_dir = 0
+        steps = []
+        previous = world.paddle_pos
+        for frame in range(40):                              # 0.66 с удержания
+            now = frame * dt
+            if frame % 10 == 0:                              # событие каждые 10 кадров
+                tracker.press(1, now)
+            world.paddle_dir = tracker.active_direction(now)
+            ark.move_paddle(world, dt)
+            steps.append(world.paddle_pos - previous)
+            previous = world.paddle_pos
+        self.assertGreater(tracker.gap, 0.12, "должен выучить медленный автоповтор")
+        stopped = sum(1 for s in steps[12:] if s <= 1e-9)
+        self.assertEqual(stopped, 0, f"ракета встала {stopped} кадров при удержании (дёргается)")
+
+    def test_release_is_detected_and_paddle_brakes(self):
+        tracker = ark.KeyRepeatTracker(initial_gap=0.05)
+        tracker.press(1, 0.0)
+        tracker.press(1, 0.05)
+        self.assertTrue(tracker.holding, "второе событие в ритме — это удержание")
+        self.assertEqual(tracker.active_direction(0.06), 1)
+        self.assertEqual(tracker.active_direction(0.05 + 0.05 * ark.HOLD_TOLERANCE + 0.01), 0)
+
+    def test_change_of_direction_is_a_new_tap(self):
+        tracker = ark.KeyRepeatTracker(initial_gap=0.03)
+        tracker.press(1, 0.0)
+        self.assertTrue(tracker.press(1, 0.03))
+        self.assertFalse(tracker.press(-1, 0.06), "смена направления — не повтор")
+        self.assertEqual(tracker.direction, -1)
+
+
+class KeyDecoderTest(unittest.TestCase):
+    """Стрелки должны работать и на терминалах без application cursor mode."""
+
+    def decode(self, sequence: bytes) -> list[int]:
+        decoder = ark.KeyDecoder()
+        return [key for key in (decoder.feed(byte) for byte in sequence) if key is not None]
+
+    def test_both_cursor_forms_decode(self):
+        for sequence in (b"\x1b[C", b"\x1bOC"):
+            self.assertEqual(self.decode(sequence), [curses.KEY_RIGHT], sequence)
+        for sequence in (b"\x1b[D", b"\x1bOD"):
+            self.assertEqual(self.decode(sequence), [curses.KEY_LEFT], sequence)
+
+    def test_modified_and_home_end(self):
+        self.assertEqual(self.decode(b"\x1b[1;5C"), [curses.KEY_RIGHT])     # Ctrl+Right
+        self.assertEqual(self.decode(b"\x1b[H"), [ark.KEY_HOME])
+        self.assertEqual(self.decode(b"\x1bOF"), [ark.KEY_END])
+
+    def test_plain_keys_pass_through_and_stray_bytes_are_swallowed(self):
+        self.assertEqual(self.decode(b"q"), [ord("q")])
+        self.assertEqual(self.decode(b" "), [ord(" ")])
+        self.assertEqual(self.decode(b"\x1b"), [], "одинокий ESC не должен никуда вести")
+        self.assertEqual(self.decode(b"\x1b[<0;42;12M"), [], "мышиный мусор не должен становиться буквой M")
+
+    def test_two_sequences_back_to_back(self):
+        self.assertEqual(self.decode(b"\x1b[C\x1b[D"), [curses.KEY_RIGHT, curses.KEY_LEFT])
+        self.assertEqual(self.decode(b"\x1b[Cq"), [curses.KEY_RIGHT, ord("q")])
+
+    def test_reset_drops_partial_sequence(self):
+        decoder = ark.KeyDecoder()
+        decoder.feed(27)
+        decoder.feed(ord("["))
+        decoder.reset()
+        self.assertEqual(decoder.feed(ord("C")), ord("C"), "после reset буфер чист")
+
+
+class CursesCompatTest(unittest.TestCase):
+    """Сборки curses бывают без мыши и без цвета — падать посреди игры нельзя."""
+
+    def test_missing_functions_resolve_to_none(self):
+        self.assertIsNone(ark._curses_func("такой_функции_в_curses_нет"))
+        self.assertIsNone(ark._curses_func("error"))          # класс исключения — не функция
+        self.assertTrue(callable(ark._curses_func("initscr")))
+
+    def test_mouse_capability_flags_are_consistent(self):
+        self.assertEqual(ark.HAS_MOUSE, bool(ark.MOUSE_MASK and ark.GET_MOUSE and ark.MOUSE_EVENTS))
+        self.assertIsInstance(ark.KEY_MOUSE, int)
+
+    def test_colors_available_never_raises(self):
+        self.assertIn(ark.colors_available(), (True, False))
+
+    def test_curses_failure_covers_attribute_error(self):
+        # именно AttributeError ронял игру на сборках без curses.getmouse
+        self.assertIn(AttributeError, ark.CURSES_FAILURE)
+        self.assertIn(ValueError, ark.CURSES_FAILURE)
 
 
 class ScorePathTest(unittest.TestCase):

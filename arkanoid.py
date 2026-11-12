@@ -15,6 +15,8 @@ README).
 Управление:
     ← →  (или h/l) — движение ракетки, удержание работает
     Пробел         — запустить / поймать шарик
+    Home / End     — ракетку к левой / правой стенке
+    Ctrl-L         — перерисовать экран
     Мышь           — ракетка следует за курсором
     p              — пауза
     s              — звук вкл/выкл
@@ -30,46 +32,159 @@ from __future__ import annotations
 import argparse
 import curses
 import locale
+import math
 import os
 import random
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+# --- Совместимость со сборками curses --------------------------------------
+# На Windows (windows-curses), в сборочных терминах и в нетипичных сборках
+# части функций мыши в модуле просто нет — вызов даёт AttributeError посреди
+# игры, а его except curses.error не ловит. Достаём всё один раз и работаем
+# через заглушки: нет мыши — играем с клавиатуры, нет цвета — монохром.
+def _curses_func(name: str):
+    func = getattr(curses, name, None)
+    # isinstance(..., type) отсекает классы исключений: они тоже callable
+    return func if callable(func) and not isinstance(func, type) else None
+
+
+MOUSE_MASK = _curses_func("mousemask")
+GET_MOUSE = _curses_func("getmouse")
+USE_DEFAULT_COLORS = _curses_func("use_default_colors")
+BEEP = _curses_func("beep")
+FLASH = _curses_func("flash")
+MOUSE_EVENTS = getattr(curses, "ALL_MOUSE_EVENTS", 0) | getattr(curses, "REPORT_MOUSE_POSITION", 0)
+KEY_MOUSE = getattr(curses, "KEY_MOUSE", -1)
+KEY_HOME = getattr(curses, "KEY_HOME", -101)
+KEY_END = getattr(curses, "KEY_END", -102)
+HAS_MOUSE = bool(MOUSE_MASK and GET_MOUSE and MOUSE_EVENTS)
+# На разных терминалах curses умудряется кидать и ValueError, и AttributeError.
+CURSES_FAILURE = (curses.error, ValueError, AttributeError)
+
+
+DEFAULT_REPEAT_GAP = 1 / 30
+REPEAT_GAP_LIMIT = (0.015, 0.20)   # правдоподобный интервал автоповтора, с
+REPEAT_ACCEPT = (0.45, 2.2)        # допуском на дребезг и просадки планировщика
+REPEAT_EMA = 0.5                   # как быстро обучаемся на этом терминале
+HOLD_TOLERANCE = 1.7               # через столько интервалов «повтор кончился»
+
+
+class KeyRepeatTracker:
+    """
+    Отличает одиночный тап клавиши от удержания — по интервалу автоповтора.
+
+    В терминале нет событий «клавишу отпустили»: при удержании прилетает тот же
+    код с постоянным интервалом (30 Гц в эмуляторе, 6-10 Гц по SSH). Поэтому:
+
+      * первое нажатие серии — всегда тап, он двигает ровно на клетку;
+      * если следующее такое же нажатие пришло в пределах ожиданного интервала —
+        это автоповтор, клавишу держат, дальше движение непрерывное;
+      * автоповтор кончился (прошло больше HOLD_TOLERANCE интервалов) — значит
+        клавишу отпустили, перестаём толкать и уходим в плавное торможение.
+
+    Окно удержания подстраивается под конкретный терминал, иначе на медленном
+    автоповторе ракетка подёргивалась в такт нажатиям, а на быстром уезжала
+    далеко от места, где палец покинул клавишу.
+    """
+
+    def __init__(self, initial_gap: float = DEFAULT_REPEAT_GAP) -> None:
+        self.gap = initial_gap
+        self.direction = 0
+        # None, а не 0.0: monotonic() в тестах и на некоторых платформах
+        # начинается с нуля, и «0.0» означало бы «нажатий ещё не было».
+        self.pressed_at: float | None = None
+        self.holding = False
+
+    def press(self, direction: int, now: float) -> bool:
+        """Вернуть True, если это повтор (то есть клавишу держат)."""
+        if not self.direction or direction != self.direction or self.pressed_at is None:
+            self.holding = False                      # новая серия: считаем тапом
+        else:
+            interval = now - self.pressed_at
+            # Пока интервал не выучен, принимаем всё, что похоже на автоповтор
+            # любого терминала (25-200 мс); дальше пояс сжимается вокруг
+            # выученного значения.
+            if interval <= REPEAT_GAP_LIMIT[1] and interval >= self.gap * REPEAT_ACCEPT[0]:
+                self.gap = min(REPEAT_GAP_LIMIT[1], max(REPEAT_GAP_LIMIT[0],
+                                  self.gap * (1 - REPEAT_EMA) + interval * REPEAT_EMA))
+                self.holding = True
+            else:
+                self.holding = False                  # слишком редко — это новый тап
+        self.direction = direction
+        self.pressed_at = now
+        return self.holding
+
+    def still_holding(self, now: float) -> bool:
+        """Жив ещё автоповтор или клавишу уже отпустили."""
+        if not self.direction or self.pressed_at is None:
+            return False
+        return (now - self.pressed_at) <= self.gap * HOLD_TOLERANCE
+
+    def active_direction(self, now: float) -> int:
+        """
+        Куда толкать ракетку в этом кадре.
+
+        Обрати внимание на self.holding: до второго события серии мы ещё не
+        знаем, тап это или удержание. Если толкать сразу (так и было сначала),
+        одиночный тап уезжал на 7 клеток вместо одной.
+        """
+        if not self.holding or not self.direction:
+            return 0
+        return self.direction if self.still_holding(now) else 0
+
+    def reset(self) -> None:
+        self.direction = 0
+        self.pressed_at = None
+        self.holding = False
+
+
+def colors_available() -> bool:
+    try:
+        return bool(curses.has_colors())
+    except CURSES_FAILURE:
+        return False
+
+
 # --- Арена -----------------------------------------------------------------
-# Поле занимает весь терминал: только что не хватает на минимальную игру.
+# Поле занимает весь терминал; не хватает только если окно совсем крошечное.
 ARENA_MIN_WIDTH = 14    # внутренних колонок
 ARENA_MIN_HEIGHT = 9    # внутренних строк
-# От этой диагонали арены масштабируется скорость и толщина стены:
-# базовый терминал 80x24 (арена ~40x16), всё остальное — пропорционально.
-REFERENCE_DIAGONAL = 43.0
-SPEED_SCALE = (0.85, 5.0)     # границы масштаба скорости
-MIN_REACTION_SECONDS = 0.35   # за сколько секунд шарик должен пролетать высоту поля
-# Законы жанра (замерены на симуляции): время пробоя стены это
-# ~0.5 * ширина_поля * ряды * плотность, и почти не зависит от скорости шарика
-# (быстрее шарик — чаще подлёты, но и кирпичей на уровне больше). Значит
-# толщину и густоту стены надо считать из размера поля, иначе на 200x60
-# уровень превращается в пятиминутное перебирание кирпичей.
-LEVEL_SECONDS = 80.0        # целевое время пробоя стены; на очень широких полях
-LEVEL_GROWTH = 0.25         # floor уровня меньше не станет — см. заметку ниже
-MAX_VX = 2                  # классический предел угла: дальше шарик не перехватить ракеткой
+REFERENCE_DIAGONAL = 43.0   # диагональ «эталонной» арены (~40x16), от неё масштабируется скорость
+SPEED_SCALE = (0.85, 5.0)   # границы этого масштаба
+MIN_REACTION_SECONDS = 0.35 # за столько секунд шарик обязан пролетать высоту поля —
+                            # ниже не стоит: игрок не успеет среагировать
+PADDLE_WIDTH_DIVISOR = 12   # ширина ракетки от ширины поля
 
-# Время пробоя уровня (замерено и выведено):
+# Время пробоя стены, выведенное и подтверждённое симуляцией:
 #
 #       время ≈ ширина_поля * прочность_кирпича * (2 * высота_поля / скорость)
 #
-# Ряды и густота кладки на него НЕ влияют: за один подлёт шарик проходит по
-# клетке в каждом ряду, и сколько из них окажутся кирпичами — столько он и
-# выбьет; произведение «кирпичей» и «шанса попасть» как раз сворачивается в
-# ширину поля. Поэтому толщина стены — это про сложность и внешний вид, а
-# скорость шарика — про темп игры (см. --speed и --arena-width).
-PADDLE_WIDTH_DIVISOR = 12     # ширина ракетки от ширины поля
+# Число рядов и густота кладки на него почти не влияют: за подлёт шарик проходит
+# по клетке в каждом ряду, поэтому «кирпичей» и «шансов попасть» всегда один и
+# тот же порядок. Значит толщина стены — это про сложность и внешний вид, а темп
+# игры задают скорость шарика и ширина поля (--speed, --arena-width).
+LEVEL_SECONDS = 80.0        # целевое время пробоя стены первого уровня
+LEVEL_GROWTH = 0.25         # насколько длиннее каждый следующий уровень
+MAX_VX = 3              # предел угла: 3 клетки по горизонтали на 1 по вертикали.
+                        # Больше — траектория становится почти горизонтальной и
+                        # ракетке надо ехать слишком быстро; меньше — широкий
+                        # уровень пробивается вдвое дольше (замерено).
 
 # --- Скорости (клеток в секунду) -------------------------------------------
 BALL_SPEED = 18.0       # базовая скорость шарика
 BALL_SPEED_PER_LEVEL = 1.5
 BALL_SPEED_MAX = 34.0
-PADDLE_TO_BALL = 2.6    # запас по скорости ракетки относительно шарика (у шарика |vx| до 2)
+# Скорость ракетки считается от максимальной горизонтальной скорости шарика
+# (|vx| * скорость) с небольшим запасом: без запаса ракета не догоняет шарик на
+# диагонали, с большим — за один кадр проезжает слишком много клеток.
+# Плавность движения даёт не низкая скорость, а ровный профиль: разгон ->
+# полка -> торможение точно в цель (см. follow_paddle_command).
+PADDLE_TO_BALL = 3.4    # примерно 1.15 x MAX_VX: запас, чтобы догонять шарик на диагонали
+PADDLE_ACCEL = 16.0     # 1/с: за 1/16 с ракетка выходит на максимум и за столько же садится
+PADDLE_SNAP = 0.02      # остаток пути и скорость меньше этого считаются нулём
+PADDLE_KEY_STEP = 1.0   # один тап клавиши = ровно одна клетка, позиция всегда точная
 POWERUP_SPEED = 7.0
 MAX_STEPS_PER_FRAME = 4  # страховка от «телепорта» при просадке FPS
 
@@ -190,6 +305,70 @@ class Arena:
         return self.bottom + 1
 
 
+class KeyDecoder:
+    """
+    Дособирает escape-последовательности, которые curses не распознал.
+
+    При nodelay(True) ncurses не ждёт хвоста последовательности, и если
+    терминал не перешёл в application cursor mode (или в terminfo нет обычного
+    kcuf=<esc>[C, как в xterm-256color), вместо KEY_RIGHT приходит мусор 27, 91, 67.
+    На такой машине стрелки просто не работают — поэтому разбираем их сами.
+    """
+
+    ESC = 27
+    LENGTH_LIMIT = 12
+    SHORT = {
+        b"[C": curses.KEY_RIGHT if hasattr(curses, "KEY_RIGHT") else -2,
+        b"OC": curses.KEY_RIGHT if hasattr(curses, "KEY_RIGHT") else -2,
+        b"[D": curses.KEY_LEFT if hasattr(curses, "KEY_LEFT") else -3,
+        b"OD": curses.KEY_LEFT if hasattr(curses, "KEY_LEFT") else -3,
+        b"[A": curses.KEY_UP if hasattr(curses, "KEY_UP") else -4,
+        b"OA": curses.KEY_UP if hasattr(curses, "KEY_UP") else -4,
+        b"[B": curses.KEY_DOWN if hasattr(curses, "KEY_DOWN") else -5,
+        b"OB": curses.KEY_DOWN if hasattr(curses, "KEY_DOWN") else -5,
+        b"[H": KEY_HOME,
+        b"OH": KEY_HOME,
+        b"[F": KEY_END,
+        b"OF": KEY_END,
+    }
+    # хвост последовательности с модификаторами (\e[1;5C — Ctrl+Right)
+    LAST = {ord("C"): SHORT[b"[C"], ord("D"): SHORT[b"[D"], ord("A"): SHORT[b"[A"],
+            ord("B"): SHORT[b"[B"], ord("H"): KEY_HOME, ord("F"): KEY_END}
+    PREFIXES = (b"[", b"O")
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def feed(self, code: int) -> int | None:
+        """Код клавиши для игры, либо None — байт съеден (ждём продолжения)."""
+        if not self.buffer:
+            if code == self.ESC:
+                self.buffer.append(ord("\x1b"))
+                return None
+            return code
+
+        self.buffer.append(code & 0xFF)
+        raw = bytes(self.buffer[1:])
+
+        if raw in self.SHORT:
+            self.reset()
+            return self.SHORT[raw]
+        if len(self.buffer) > self.LENGTH_LIMIT:
+            self.reset()
+            return None
+        # Послетилитный байт ('[' или 'O') и цифры с точками — ещё не конец:
+        # последовательность кончается ОДНИМ из известных терминаторов (C/D/A/B/H/F).
+        if raw[:1] in self.PREFIXES and raw[-1] in self.LAST:
+            key = self.LAST[raw[-1]]
+            self.reset()
+            return key
+        return None
+
+    def reset(self) -> None:
+        self.buffer.clear()
+
+
+
 def score_file_from_env() -> Path:
     """Куда класть рекорд; пустой ARKANOID_SCORE не должен превращать путь в «.»."""
     raw = os.environ.get("ARKANOID_SCORE") or "~/.local/share/arkanoid/score.json"
@@ -258,8 +437,10 @@ class World:
     balls: list[Ball] = field(default_factory=list)
     powerups: list[PowerUp] = field(default_factory=list)
 
-    paddle_pos: float = 0.0              # положение ракетки (вещественное — плавный ход)
-    paddle_target: float | None = None   # цель от мыши
+    paddle_pos: float = 0.0              # где ракетка на самом деле (вещественное — плавный ход)
+    paddle_cmd: float = 0.0              # куда её просит игрок (следует за pos с ускорением)
+    paddle_vel: float = 0.0              # текущая скорость, клеток/с
+    paddle_target: float | None = None   # цель от мыши (или тестового «игрока»)
     paddle_dir: int = 0                  # -1 / 0 / 1 при удержании клавиши
 
     combo: int = 0
@@ -281,6 +462,7 @@ class World:
         self.paddle_pos = float(
             self.arena.inner_left + max(0, (self.arena.inner_width - self.paddle_width) // 2)
         )
+        self.paddle_cmd = self.paddle_pos
         self.spawn_ball()
 
     # --- геометрия ---------------------------------------------------------
@@ -314,6 +496,20 @@ class World:
     def paddle_speed(self) -> float:
         """Ракетка успевает за шариком: запас PADDLE_TO_BALL к его скорости."""
         return PADDLE_TO_BALL * self.speed
+
+    @property
+    def paddle_accel(self) -> float:
+        """Ускорение ракетки, клеток/с². Привязано к макс. скорости: время разгона
+        одинаковое и на 40, и на 200 колонок."""
+        return PADDLE_ACCEL * self.paddle_speed
+
+    @property
+    def paddle_min(self) -> float:
+        return float(self.left)
+
+    @property
+    def paddle_max(self) -> float:
+        return float(max(self.left, self.field_right - self.paddle_width + 1))
 
     @property
     def max_vx(self) -> int:
@@ -659,17 +855,90 @@ def step_powerups(world: World, dt: float, events: list[Event]) -> None:
 
 
 def move_paddle(world: World, dt: float) -> None:
-    """Ракетка: удержание клавиши или плавное следование за мышью."""
-    if world.paddle_target is not None:
-        delta = world.paddle_target - world.paddle_pos
-        step = world.paddle_speed * dt
-        world.paddle_pos += max(-step, min(step, delta))
-    else:
-        world.paddle_pos += world.paddle_dir * world.paddle_speed * dt
+    """
+    Ракетка едет к «командной» позиции, а не телепортируется в неё.
 
-    world.paddle_pos = float(
-        clamp(world.paddle_pos, world.left, max(world.left, world.field_right - world.paddle_width + 1))
-    )
+    Схема такая: игрок (клавиши, мышь, тестовый бот) дёргает только paddle_cmd,
+    а paddle_pos догоняет его с ограниченным ускорением. Профиль скорости
+    трапецеидальный: разгон -> полка на максимуме -> торможение ровно в цель,
+    поэтому без разницы, тапнул игрок один раз или зажал клавишу — ракетка
+    нигде не проскакивает нужную клетку и не дёргается на старте.
+    """
+    if world.paddle_target is not None:
+        world.paddle_cmd = world.paddle_target
+    elif world.paddle_dir:
+        world.paddle_cmd += world.paddle_dir * world.paddle_speed * dt
+    elif abs(world.paddle_cmd - world.paddle_pos) <= PADDLE_SNAP:
+        # Ввода нет и незакрытой команды тоже нет (клавишу отпустили на ходу):
+        # плавно гасим скорость. Если команда ещё впереди — едем к ней, иначе
+        # одиночный тап клавиши терялся бы, не начавшись.
+        glide_paddle_to_stop(world, dt)
+        return
+
+    world.paddle_cmd = float(clamp(world.paddle_cmd, world.paddle_min, world.paddle_max))
+    follow_paddle_command(world, dt)
+
+
+def glide_paddle_to_stop(world: World, dt: float) -> None:
+    """
+    Ввода нет (клавишу отпустили) — чистое торможение вдоль движения.
+
+    Соблазн «поставить целью точку остановки» не работает: точку пришлось бы
+    пересчитывать каждый кадр, и получаются «бегущие ворота» — по тормозной
+    кривой ракета всегда ещё может остановиться в цели, то есть никогда не
+    тормозит (замерено: 30 клеток проноса вместо 4). Поэтому здесь просто
+    гасим скорость с тем же ускорением: съезд плавный, без возврата назад.
+    """
+    if world.paddle_vel:
+        # знак противоположен скорости: гасим её, а не разгоняем
+        brake = -math.copysign(min(abs(world.paddle_vel), world.paddle_accel * dt), world.paddle_vel)
+        world.paddle_vel += brake
+        world.paddle_pos += world.paddle_vel * dt
+
+        if world.paddle_pos < world.paddle_min or world.paddle_pos > world.paddle_max:
+            world.paddle_pos = float(clamp(world.paddle_pos, world.paddle_min, world.paddle_max))
+            world.paddle_vel = 0.0
+
+    if world.paddle_vel == 0.0:
+        world.paddle_cmd = world.paddle_pos
+
+
+def follow_paddle_command(world: World, dt: float) -> None:
+    """Один шаг разгона/торможения ракетки к world.paddle_cmd."""
+    accel = world.paddle_accel
+    distance = world.paddle_cmd - world.paddle_pos
+    stopping = world.paddle_vel**2 / (2 * accel)     # путь до полной остановки
+
+    if abs(distance) <= PADDLE_SNAP and stopping <= PADDLE_SNAP:
+        # доехали: фиксируем позицию ровно на клетке, чтобы шарик отскакивал
+        # предсказуемо, а не от «почти приехавшей» ракетки
+        world.paddle_pos = world.paddle_cmd
+        world.paddle_vel = 0.0
+        return
+
+    # Скорость, при которой ещё успеем затормозить именно в цели (v = sqrt(2*a*s)):
+    # пока далеко — выходит на максимум, вблизи сам собой начинается плавный съезд.
+    allowed = math.copysign(math.sqrt(2.0 * accel * abs(distance)), distance)
+    desired = allowed if abs(allowed) <= world.paddle_speed else math.copysign(world.paddle_speed, allowed)
+
+    world.paddle_vel += clamp(desired - world.paddle_vel, -accel * dt, accel * dt)
+    new_pos = world.paddle_pos + world.paddle_vel * dt
+
+    if distance * (world.paddle_cmd - new_pos) < 0 and distance * world.paddle_vel > 0:
+        # Предсказание: с такой скоростью цель проскакивается за этот же кадр
+        # (на 60 к/с шаг ракетки больше клетки). Доезжаем ровно до цели и встаём —
+        # иначе контроллер начинает «звенеть» вокруг цели, а это и есть рывки.
+        # Условие на знак скорости нужно, чтобы это не работало как телепорт
+        # назад: если ракета уже пролетела цель, она честно дотормаживает.
+        world.paddle_pos = world.paddle_cmd
+        world.paddle_vel = 0.0
+    else:
+        world.paddle_pos = new_pos
+
+    if world.paddle_pos < world.paddle_min or world.paddle_pos > world.paddle_max:
+        world.paddle_pos = float(clamp(world.paddle_pos, world.paddle_min, world.paddle_max))
+        world.paddle_vel = 0.0            # об стенку ракетка бьётся без отскока
+        world.paddle_cmd = world.paddle_pos
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -768,9 +1037,9 @@ def resize(world: World, width: int, height: int) -> None:
     world.width, world.height = width, height
     world.arena = Arena.fit(width, height, world.cfg.max_arena_width)
     world.speed = world.level_speed(world.level)
-    world.paddle_pos = float(
-        clamp(world.paddle_pos, world.left, max(world.left, world.field_right - world.paddle_width + 1))
-    )
+    world.paddle_pos = float(clamp(world.paddle_pos, world.paddle_min, world.paddle_max))
+    world.paddle_cmd = world.paddle_pos
+    world.paddle_vel = 0.0
     world.reset_level()
     world.powerups = []
     world.balls = []
@@ -813,17 +1082,18 @@ class Sound:
             return
         self._last = now
         try:
-            if kind == "flash":
-                curses.flash()
-            curses.beep()
-        except curses.error:
+            if BEEP:
+                if kind == "flash" and FLASH:
+                    FLASH()
+                BEEP()
+        except CURSES_FAILURE:
             pass
 
 
 # ---------------------------------------------------------------------------
 # Отрисовка
 # ---------------------------------------------------------------------------
-HINT = "← → / h l — ракетка · Пробел — пуск/ловля · p — пауза · s — звук · r — заново · q — выход"
+HINT = "← → / h l — ракетка (тап = клетка, держать = разгон) · Пробел — пуск · p — пауза · s — звук · q — выход"
 POWERUP_HINT = "бонусы: E шире · S тормоз · L жизнь · M мульти"
 
 
@@ -862,16 +1132,24 @@ class Renderer:
             "dim": curses.A_DIM,
             "over": curses.A_BOLD,
         }
-        if not color or not curses.has_colors():
+        if not color or not colors_available():
             return attrs
 
         try:
             curses.start_color()
-            curses.use_default_colors()
-        except curses.error:
+        except CURSES_FAILURE:
             return attrs
+        if USE_DEFAULT_COLORS:
+            try:
+                USE_DEFAULT_COLORS()
+            except CURSES_FAILURE:
+                pass
 
-        if curses.COLORS < 8:
+        try:
+            colours = curses.COLORS
+        except CURSES_FAILURE:
+            colours = 0
+        if colours < 8:
             return attrs
 
         brick_colors = {
@@ -894,7 +1172,7 @@ class Renderer:
         for hp, colour in brick_colors.items():
             try:
                 curses.init_pair(index, colour, -1)
-            except curses.error:
+            except CURSES_FAILURE:
                 continue
             attrs["brick"][hp] |= curses.color_pair(index)
             index += 1
@@ -902,7 +1180,7 @@ class Renderer:
         for name, colour in single_colors.items():
             try:
                 curses.init_pair(index, colour, -1)
-            except curses.error:
+            except CURSES_FAILURE:
                 continue
             attrs[name] |= curses.color_pair(index)
             index += 1
@@ -918,6 +1196,11 @@ class Renderer:
 
     def begin(self) -> None:
         for row in self.cells:
+            row[:] = self.blank
+
+    def forget_screen(self) -> None:
+        """Забыть, что было на экране: следующий flush redrawнет всё."""
+        for row in self.prev:
             row[:] = self.blank
 
     def put(self, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -943,8 +1226,8 @@ class Renderer:
                 if row[run_start:end] != old[run_start:end]:
                     try:
                         self.scr.addstr(y, run_start, "".join(c for c, _ in row[run_start:end]), attr)
-                    except curses.error:
-                        pass  # правый нижний угол curses не умеет
+                    except CURSES_FAILURE:
+                        pass  # в правый нижний угол curses писать не умеет
                 run_start = end
         self.prev, self.cells = self.cells, self.prev
 
@@ -1051,7 +1334,6 @@ def save_record(path: Path, value: int) -> None:
 # ---------------------------------------------------------------------------
 # Игра: ввод, цикл, размеры терминала
 # ---------------------------------------------------------------------------
-HOLD_SECONDS = 0.15   # «удержание» клавиши: автоповтор продлевает это окно
 MIN_HEIGHT = 14
 MIN_WIDTH = 40
 
@@ -1060,14 +1342,15 @@ class Game:
     def __init__(self, stdscr, cfg: Config) -> None:
         try:
             curses.curs_set(0)
-        except curses.error:
+        except CURSES_FAILURE:
             pass
         stdscr.keypad(True)
         stdscr.nodelay(True)
-        try:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-        except curses.error:
-            pass
+        if HAS_MOUSE:
+            try:
+                MOUSE_MASK(MOUSE_EVENTS)
+            except CURSES_FAILURE:
+                pass
 
         self.scr = stdscr
         self.cfg = cfg
@@ -1078,9 +1361,11 @@ class Game:
         self.record = load_record(cfg.highscore_file)
         self.paused = False
         self.record_dirty = False
+        self.forced_redraw = False
+        self.keys = KeyDecoder()
+        self.repeat = KeyRepeatTracker()
         self.message = "Пробел — запустить шарик"
         self.message_until = time.monotonic() + 3.0
-        self.hold_until = 0.0
         self.mouse_until = 0.0
 
     # --- главный цикл ------------------------------------------------------
@@ -1094,8 +1379,7 @@ class Game:
                 break
 
             now = time.monotonic()
-            if now > self.hold_until:
-                self.world.paddle_dir = 0
+            self.world.paddle_dir = self.repeat.active_direction(now)
             if now > self.mouse_until:
                 self.world.paddle_target = None
 
@@ -1122,6 +1406,14 @@ class Game:
             if self.world.over and self.record_dirty:
                 save_record(self.cfg.highscore_file, self.record)
                 self.record_dirty = False
+
+            if self.forced_redraw:
+                self.forced_redraw = False
+                try:
+                    self.scr.erase()
+                except CURSES_FAILURE:
+                    pass
+                self.renderer.forget_screen()
 
             self.renderer.draw(
                 self.world,
@@ -1153,11 +1445,20 @@ class Game:
 
     # --- ввод --------------------------------------------------------------
     def handle_input(self) -> bool:
-        """Обработка всех нажатых клавиш. False — пора выходить."""
+        """
+        Обработка всех нажатых за кадр клавиш. False — пора выходить.
+
+        Декодер в конце кадра сбрасывается: одинокий ESC (или оборванный хвост
+        последовательности) не должен склеиться со следующим нажатием.
+        """
         while True:
-            key = self.scr.getch()
-            if key == -1:
+            code = self.scr.getch()
+            if code == -1:
+                self.keys.reset()
                 return True
+            key = self.keys.feed(code)
+            if key is None:
+                continue                     # ждём остальные байты последовательности
             if not self.handle_key(key):
                 return False
 
@@ -1174,18 +1475,22 @@ class Game:
             self.handle_resize()
             return True
 
-        if key == curses.KEY_MOUSE:
+        if key in (12, 18):        # Ctrl-L / Ctrl-R: перерисовать экран после мусора в терминале
+            self.forced_redraw = True
+            return True
+
+        if key == KEY_MOUSE and HAS_MOUSE:
             self.handle_mouse()
             return True
 
         if key in (curses.KEY_LEFT, ord("h"), ord("а"), ord("H"), ord("А")):
-            world.paddle_dir = -1
-            world.paddle_target = None
-            self.hold_until = now + HOLD_SECONDS
+            self.nudge_paddle(-1)
         elif key in (curses.KEY_RIGHT, ord("l"), ord("д"), ord("L"), ord("Д")):
-            world.paddle_dir = 1
-            world.paddle_target = None
-            self.hold_until = now + HOLD_SECONDS
+            self.nudge_paddle(1)
+        elif key == KEY_HOME:
+            self.move_paddle_to(world.paddle_min)
+        elif key == KEY_END:
+            self.move_paddle_to(world.paddle_max)
         elif key in (ord("s"), ord("ы"), ord("S"), ord("Ы")):
             self.sound.enabled = not self.sound.enabled
             self.say(f"Звук: {'вкл' if self.sound.enabled else 'выкл'}", 1.2)
@@ -1198,10 +1503,35 @@ class Game:
                 self.say("", 0.0)
         return True
 
+    def move_paddle_to(self, position: float) -> None:
+        """Home/End: задать цель, а ракета доедет сама с разгоном и торможением."""
+        self.repeat.reset()
+        self.world.paddle_target = None
+        self.world.paddle_cmd = float(clamp(position, self.world.paddle_min, self.world.paddle_max))
+
+    def nudge_paddle(self, direction: int) -> None:
+        """
+        Нажатие клавиши движения: тап = ровно клетка, удержание = сплошной ход.
+
+        Различает KeyRepeatTracker. Важно, что при удержании команда толкается
+        только в main-loop (paddle_dir), а не ещё и по каждому событию: иначе
+        автоповтор и непрерывное движение складывались бы и ракета летела вдвое
+        быстрее максимума.
+        """
+        world = self.world
+        world.paddle_target = None
+        if not self.repeat.press(direction, time.monotonic()):
+            world.paddle_cmd = float(clamp(world.paddle_cmd + direction * PADDLE_KEY_STEP,
+                                           world.paddle_min, world.paddle_max))
+        # paddle_dir выставляет main-loop по active_direction(), а не здесь:
+        # иначе одиночный тап успевал бы ещё и подтолкнуть команду на пару клеток.
+
     def handle_mouse(self) -> None:
+        if GET_MOUSE is None:
+            return
         try:
-            event = curses.getmouse()
-        except curses.error:
+            event = GET_MOUSE()
+        except CURSES_FAILURE:
             return
         if event.x > 0:
             self.world.paddle_target = float(event.x - self.world.paddle_width // 2)
@@ -1212,7 +1542,7 @@ class Game:
 
     def handle_resize(self) -> None:
         height, width = self.scr.getmaxyx()
-        self.renderer.resize(height, width)
+        self.renderer.resize(height, width)   # буферы пересозданы — экран redrawнется сам
         resize(self.world, width, height)
         if height < MIN_HEIGHT or width < MIN_WIDTH:
             self.say(f"Тесно: нужно минимум {MIN_WIDTH}x{MIN_HEIGHT}", 3.0)
@@ -1220,6 +1550,7 @@ class Game:
     def restart(self) -> None:
         height, width = self.scr.getmaxyx()
         self.world = new_world(width, height, self.cfg)
+        self.repeat.reset()
         self.paused = False
         self.say("Новая игра", 1.5)
 
@@ -1227,16 +1558,33 @@ class Game:
 # ---------------------------------------------------------------------------
 # Прогон физики без терминала: python arkanoid.py --smoke 30
 # ---------------------------------------------------------------------------
+def predict_ball_x(ball: Ball, world: World, row: int, limit: int = 400) -> float:
+    """Куда придёт шарик на строку `row`, с учётом отскоков от стенок."""
+    if ball.stuck or ball.vy <= 0 or ball.y >= row:
+        return float(ball.x)
+
+    x, vx = float(ball.x), ball.vx
+    steps = row - ball.y
+    for _ in range(min(steps, limit)):
+        x += vx
+        if x < world.left:
+            x, vx = float(world.left), abs(vx)
+        elif x > world.field_right:
+            x, vx = float(world.field_right), -abs(vx)
+    return x
+
+
 def aim_ai_paddle(world: World) -> None:
     """
-    Болван игрока для тестов: догоняет шарик ракеткой. Идеальный — зато
-    проверяет худший случай: ракетка не помогает шарику «собирать» кирпичи,
-    и вся надежда на анти-залипание.
+    Болван игрока для тестов: ставит ракетку в точку прибытия шарика, а не
+    туда, где шарик сейчас, — как это делает живой игрок. Реактивное слежение
+    на больших полях давало сотни ложных смертей и ломало все замеры баланса.
     """
     if not world.balls:
         return
-    ball = world.balls[0]
-    world.paddle_target = ball.x - world.paddle_width / 2
+    ball = min(world.balls, key=lambda item: abs(item.x - world.paddle_pos))
+    aim = predict_ball_x(ball, world, world.paddle_y)
+    world.paddle_target = aim - world.paddle_width / 2
 
 
 def run_smoke(seconds: float, cfg: Config, width: int = 80, height: int = 24) -> int:
@@ -1244,7 +1592,7 @@ def run_smoke(seconds: float, cfg: Config, width: int = 80, height: int = 24) ->
     Инварианты, зафиксированные по мотивам багов прошлой версии:
 
       1. шарик не покидает поле;
-      2. у летящего шарика |vx| ∈ {1, 2} (нет «столба» вверх-вниз с бесконечными очками);
+      2. у летящего шарика 1 <= |vx| <= world.max_vx (нет «столба» вверх-вниз);
       3. ракетка не выезжает за границы;
       4. игра реально прогрессирует (кирпичи разбиваются, жизни теряются).
     """
@@ -1268,8 +1616,8 @@ def run_smoke(seconds: float, cfg: Config, width: int = 80, height: int = 24) ->
         for ball in world.balls:
             if not world.left <= ball.x <= world.field_right or not world.ceiling <= ball.y <= world.floor_y:
                 problems.append(f"кадр {frame}: шарик вне поля ({ball.x},{ball.y})")
-            if not ball.stuck and abs(ball.vx) not in (1, 2):
-                problems.append(f"кадр {frame}: у шарика неверный vx={ball.vx} в x={ball.x}")
+            if not ball.stuck and not 1 <= abs(ball.vx) <= world.max_vx:
+                problems.append(f"кадр {frame}: у шарика недопустимый vx={ball.vx} в x={ball.x}")
         if not world.left <= world.paddle_x <= world.field_right - world.paddle_width + 1:
             problems.append(f"кадр {frame}: ракетка за границей x={world.paddle_x}")
 
@@ -1343,7 +1691,7 @@ def run_game(stdscr, cfg: Config) -> None:
         try:
             stdscr.addstr(0, 0, text[: max(0, width - 1)])
             stdscr.getch()
-        except curses.error:
+        except CURSES_FAILURE:
             pass
         return
 
@@ -1384,8 +1732,9 @@ def main(argv: list[str] | None = None) -> int:
         curses.wrapper(run_game, cfg)
     except KeyboardInterrupt:
         pass
-    except curses.error as exc:
+    except CURSES_FAILURE as exc:
         print(f"arkanoid: терминал не подходит для curses ({exc}). TERM={os.environ.get('TERM')!r}")
+        print("Нужен Python 3.10+ (запускать python3, не python) и интерактивный терминал.")
         return 1
     return 0
 
