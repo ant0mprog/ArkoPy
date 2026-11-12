@@ -1287,8 +1287,10 @@ def run_smoke(seconds: float, cfg: Config, width: int = 80, height: int = 24) ->
         print("ПРОБЛЕМА:", problem)
     if broken < frames // 200:
         problems.append("кирпичи почти не разрушаются — игра стоит")
-    if levels == 0 and seconds >= 120:
-        print("ПРЕДУПРЕЖДЕНИЕ: за прогон не пройден ни один уровень")
+    # «Уровень не пройден» — не беда на огромном поле: там он объективно длинный.
+    if levels == 0 and seconds > max(120.0, 1.5 * world.estimated_level_seconds):
+        print(f"ПРЕДУПРЕЖДЕНИЕ: за {seconds:.0f} с не пройден ни один уровень "
+              f"(прогноз пробоя {world.estimated_level_seconds:.0f} с)")
 
     return 1 if problems else 0
 
