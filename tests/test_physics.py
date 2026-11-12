@@ -78,7 +78,7 @@ class PhysicsTest(unittest.TestCase):
     def test_fast_ball_is_caught_by_paddle(self):
         """Отскок проверяется пересечением линии, а не совпадением строки."""
         world = make_world()
-        world.speed = ark.BALL_SPEED_MAX
+        world.speed = 3 * world.cfg.fps        # 3 клетки за кадр — точно больше одной
         ball = free_ball(world, world.paddle_x + 3, world.paddle_y - 2, vx=1, vy=1)
         for _ in range(400):
             ark.advance(world, 1 / 60)
