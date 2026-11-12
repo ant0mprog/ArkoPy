@@ -190,6 +190,15 @@ class Arena:
         return self.bottom + 1
 
 
+def score_file_from_env() -> Path:
+    """Куда класть рекорд; пустой ARKANOID_SCORE не должен превращать путь в «.»."""
+    raw = os.environ.get("ARKANOID_SCORE") or "~/.local/share/arkanoid/score.json"
+    return Path(raw).expanduser()
+
+
+DEFAULT_SCORE_FILE = score_file_from_env()
+
+
 @dataclass
 class Config:
     """Все настраиваемые правила игры в одном месте."""
@@ -204,9 +213,7 @@ class Config:
     color: bool = True
     powerups: bool = True
     seed: int | None = None   # None — случайное зерно
-    highscore_file: Path = Path(
-        os.environ.get("ARKANOID_SCORE", "~/.local/share/arkanoid/score.json")
-    )
+    highscore_file: Path = DEFAULT_SCORE_FILE
 
 
 @dataclass
@@ -1025,16 +1032,18 @@ def _utf8_term() -> bool:
 # Рекорды
 # ---------------------------------------------------------------------------
 def load_record(path: Path) -> int:
+    """Рекорд — мелочь: если файла нет или он битый, начинаем с нуля."""
     try:
-        return int(path.read_text().strip() or 0)
+        return int(Path(path).expanduser().read_text().strip() or 0)
     except (OSError, ValueError):
         return 0
 
 
 def save_record(path: Path, value: int) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(value))
+        target = Path(path).expanduser()   # без expanduser '~' создаёт папку в cwd
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(value))
     except OSError:
         pass  # рекорд — не критично
 
